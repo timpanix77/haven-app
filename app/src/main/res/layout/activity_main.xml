@@ -1,0 +1,175 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="vertical"
+    android:background="#000000"
+    android:padding="20dp"
+    android:weightSum="10">
+
+    <TextView
+        android:id="@+id/tvTitle"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="HAVEN AUTONOMIC FLIGHT DECK"
+        android:textColor="#757575"
+        android:textSize="12sp"
+        android:letterSpacing="0.15"
+        android:gravity="center"
+        android:fontFamily="monospace"/>
+
+    <TextView
+        android:id="@+id/tvMode"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="[ ☀️ COCKPIT LIVE ]"
+        android:textColor="#43A047"
+        android:textSize="14sp"
+        android:textStyle="bold"
+        android:gravity="center"
+        android:fontFamily="monospace"
+        android:layout_marginTop="8dp"/>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="5"
+        android:orientation="vertical"
+        android:gravity="center">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="LIVE TELEMETRY"
+            android:textColor="#757575"
+            android:textSize="12sp"
+            android:fontFamily="monospace"/>
+
+        <TextView
+            android:id="@+id/tvLiveHr"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="--"
+            android:textColor="#FFFFFF"
+            android:textSize="96sp"
+            android:textStyle="bold"
+            android:fontFamily="monospace"/>
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="BPM"
+            android:textColor="#757575"
+            android:textSize="14sp"
+            android:fontFamily="monospace"/>
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="2"
+        android:orientation="horizontal"
+        android:weightSum="2"
+        android:background="#111111"
+        android:padding="12dp">
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:orientation="vertical"
+            android:gravity="center">
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="EXCURSION"
+                android:textColor="#757575"
+                android:textSize="11sp"
+                android:fontFamily="monospace"/>
+            <TextView
+                android:id="@+id/tvExcursion"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="00:00"
+                android:textColor="#FFFFFF"
+                android:textSize="24sp"
+                android:textStyle="bold"
+                android:fontFamily="monospace"/>
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="match_parent"
+            android:layout_weight="1"
+            android:orientation="vertical"
+            android:gravity="center">
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="DAILY DEBT"
+                android:textColor="#757575"
+                android:textSize="11sp"
+                android:fontFamily="monospace"/>
+            <TextView
+                android:id="@+id/tvDailyDebt"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="00:00"
+                android:textColor="#FFB300"
+                android:textSize="24sp"
+                android:textStyle="bold"
+                android:fontFamily="monospace"/>
+        </LinearLayout>
+    </LinearLayout>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="0dp"
+        android:layout_weight="3"
+        android:orientation="vertical"
+        android:gravity="bottom"
+        android:paddingTop="10dp">
+
+        <Button
+            android:id="@+id/btnArmService"
+            android:layout_width="match_parent"
+            android:layout_height="55dp"
+            android:text="ARM 24/7 PACING ENGINE"
+            android:backgroundTint="#222222"
+            android:textColor="#43A047"
+            android:fontFamily="monospace"
+            android:textStyle="bold"/>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:weightSum="2"
+            android:layout_marginTop="8dp">
+
+            <Button
+                android:id="@+id/btnExportVault"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_weight="1"
+                android:text="EXPORT VAULT"
+                android:backgroundTint="#161616"
+                android:textColor="#CCCCCC"
+                android:textSize="11sp"
+                android:fontFamily="monospace"
+                android:layout_marginEnd="4dp"/>
+
+            <Button
+                android:id="@+id/btnImportVault"
+                android:layout_width="0dp"
+                android:layout_height="48dp"
+                android:layout_weight="1"
+                android:text="RESTORE VAULT"
+                android:backgroundTint="#161616"
+                android:textColor="#CCCCCC"
+                android:textSize="11sp"
+                android:fontFamily="monospace"
+                android:layout_marginStart="4dp"/>
+        </LinearLayout>
+    </LinearLayout>
+</LinearLayout>
