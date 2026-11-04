@@ -21,8 +21,7 @@ import android.os.IBinder
 import android.os.Looper
 import androidx.core.app.NotificationCompat
 import com.haven.pacing.MainActivity
-import com.haven.pacing.R
-import com.haven.pacing.audio.AudioEngine
+import com.haven.pacing.audio.HavenAudioEngine
 import com.haven.pacing.data.ExcursionRecord
 import com.haven.pacing.data.HavenDatabase
 import com.haven.pacing.engine.AutonomicStateMachine
@@ -61,7 +60,7 @@ class HavenPacingService : Service() {
     private val serviceJob = SupervisorJob()
     private val serviceScope = CoroutineScope(Dispatchers.Main + serviceJob)
 
-    private lateinit var audioEngine: AudioEngine
+    private lateinit var audioEngine: HavenAudioEngine
     private lateinit var vaultDatabase: HavenDatabase
     private lateinit var stateMachine: AutonomicStateMachine
 
@@ -83,7 +82,7 @@ class HavenPacingService : Service() {
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification("Starting telemetry..."))
 
-        audioEngine = AudioEngine(this)
+        audioEngine = HavenAudioEngine(this)
         vaultDatabase = HavenDatabase.getDatabase(this)
 
         stateMachine = AutonomicStateMachine(
@@ -281,7 +280,7 @@ class HavenPacingService : Service() {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("HAVEN Autonomic Engine")
             .setContentText(text)
-            .setSmallIcon(R.drawable.ic_launcher_foreground)
+            .setSmallIcon(android.R.drawable.stat_sys_data_bluetooth)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
