@@ -105,7 +105,7 @@ class MainActivity : AppCompatActivity() {
                 val file = vaultManager.exportVault(this@MainActivity)
                 withContext(Dispatchers.Main) {
                     if (file != null) {
-                        Toast.makeText(this@MainActivity, "Vault Exported: ${file.name}", Toast.LENGTH_LONG).show()
+                        Toast.makeText(this@MainActivity, "Vault Exported: " + file.name, Toast.LENGTH_LONG).show()
                     } else {
                         Toast.makeText(this@MainActivity, "Export Failed", Toast.LENGTH_SHORT).show()
                     }
@@ -143,7 +143,9 @@ class MainActivity : AppCompatActivity() {
         super.onPause()
         try {
             unregisterReceiver(hudReceiver)
-        } catch (_: Exception) {}
+        } catch (e: Exception) {
+            // Receiver unregistered cleanly
+        }
         HavenPacingService.onTelemetryUpdate = null
     }
 
@@ -160,7 +162,7 @@ class MainActivity : AppCompatActivity() {
         // 1. Live BPM and Proximity Bar
         if (hr > 0) {
             tvLiveHr.text = hr.toString()
-            vuHr.setLevel((hr - 40).coerceAtLeast(0).toFloat(), 70f) // 40-110 BPM range
+            vuHr.setLevel((hr - 40).coerceAtLeast(0).toFloat(), 70f)
             when {
                 hr <= 75 -> {
                     tvLiveHr.setTextColor(Color.parseColor("#00E676"))
@@ -176,7 +178,7 @@ class MainActivity : AppCompatActivity() {
                 }
                 else -> {
                     tvLiveHr.setTextColor(Color.parseColor("#FF1744"))
-                    tvHrStatus.text = "BPM / CEILING BREACH ($ceiling)"
+                    tvHrStatus.text = "BPM / CEILING BREACH (" + ceiling + ")"
                 }
             }
         } else {
@@ -186,10 +188,10 @@ class MainActivity : AppCompatActivity() {
 
         // 2. Peak Hold Readout
         if (peakHr > 0) {
-            tvPeakIndicator.text = "PEAK: $peakHr BPM"
+            tvPeakIndicator.text = "PEAK: " + peakHr + " BPM"
         }
 
-        // 3. Excursion Stopwatch & Latched Settlement
+        // 3. Excursion Stopwatch & Buffer Countdown
         if (excSec > 0) {
             lastRecordedExcursionSec = excSec
             val m = excSec / 60
@@ -199,7 +201,7 @@ class MainActivity : AppCompatActivity() {
 
             vuGrace.setLevel(excSec.coerceAtMost(120).toFloat(), 120f)
             val remainingGrace = (120 - excSec).coerceAtLeast(0)
-            tvBufferStatus.text = "ACTIVE (${remainingGrace}s LEFT)"
+            tvBufferStatus.text = "ACTIVE (" + remainingGrace + "s LEFT)"
             tvBufferStatus.setTextColor(Color.parseColor("#FF9100"))
         } else {
             val m = lastRecordedExcursionSec / 60
@@ -214,11 +216,62 @@ class MainActivity : AppCompatActivity() {
 
         // 4. Budget Burn & Remaining Time
         val budgetMin = budgetSec / 60
-        tvBudgetLabel.text = "DAILY BUDGET (${budgetMin}m CAP)"
+        tvBudgetLabel.text = "DAILY BUDGET (" + budgetMin + "m CAP)"
         vuBudget.setLevel(totalSec.toFloat(), budgetSec.toFloat())
 
         val remainingSec = budgetSec - totalSec
         if (remainingSec >= 0) {
             val rM = remainingSec / 60
             val rS = remainingSec % 60
-            tvBudgetRemaining.text = String
+            tvBudgetRemaining.text = String.format("%02d:%02d", rM, rS)
+            tvBudgetRemaining.setTextColor(Color.parseColor("#00E676"))
+            tvPaceStatus.text = "PACE: ON TRACK"
+            tvPaceStatus.setTextColor(Color.parseColor("#00E676"))
+        } else {
+            val debtSec = -remainingSec
+            val dM = debtSec / 60
+            val dS = debtSec % 60
+            tvBudgetRemaining.text = String.format("-%02d:%02d", dM, dS)
+            tvBudgetRemaining.setTextColor(Color.parseColor("#FF1744"))
+            tvPaceStatus.text = "PACE: OVER BUDGET"
+            tvPaceStatus.setTextColor(Color.parseColor("#FF1744"))
+        }
+
+        // 5. Morning Stability Panel (0-100)
+        val stabilityTier = when {
+            stability >= 85 -> "[OPTIMAL]"
+            stability >= 70 -> "[STABLE]"
+            stability >= 50 -> "[GUARDED]"
+            stability >= 30 -> "[VULNERABLE]"
+            else            -> "[VETO / CRASH]"
+        }
+        tvStabilityBanner.text = "STABILITY: " + stability + "/100 " + stabilityTier + " | CEIL: " + ceiling + " | BUD: " + budgetMin + "m"
+
+        val bannerColor = when {
+            stability >= 70 -> Color.parseColor("#00E676")
+            stability >= 50 -> Color.parseColor("#FFEA00")
+            stability >= 30 -> Color.parseColor("#FF9100")
+            else            -> Color.parseColor("#FF1744")
+        }
+        tvStabilityBanner.setTextColor(bannerColor)
+
+        // 6. Cockpit Mode
+        if (mode == "COCKPIT_DARK") {
+            tvMode.text = "[ COCKPIT DARK ]"
+            tvMode.setTextColor(Color.parseColor("#757575"))
+        } else {
+            tvMode.text = "[ COCKPIT LIVE ]"
+            tvMode.setTextColor(Color.parseColor("#00E676"))
+        }
+    }
+
+    private fun checkPermissionsAndStartService() {
+        val permissions = mutableListOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        )
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            permissions.add(Manifest.permission.BLUETOOTH_SCAN)
+            permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
+        }
