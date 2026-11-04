@@ -16,9 +16,30 @@ import com.haven.pacing.engine.CockpitMode
 import com.haven.pacing.engine.PemPredictiveModel
 import com.haven.pacing.engine.TelemetryEvent
 import kotlinx.coroutines.*
-import java.time.LocalDate
 
 class HavenPacingService : Service() {
+    companion object {
+        var latestHr: Int = 0
+            private set
+        var latestExcursionSec: Int = 0
+            private set
+        var latestDailyDebtSec: Int = 0
+            private set
+        var latestMode: String = "COCKPIT_LIVE"
+            private set
+        var isServiceRunning: Boolean = false
+            private set
+
+        // Direct callback hook to the cockpit display
+        var onTelemetryUpdate: ((hr: Int, excursionSec: Int, debtSec: Int, mode: String) -> Unit)? = null
+            set(value) {
+                field = value
+                if (value != null && isServiceRunning) {
+                    value(latestHr, latestExcursionSec, latestDailyDebtSec, latestMode)
+                }
+            }
+    }
+
     private val NOTIF_CHANNEL_ID = "HAVEN_TELEMETRY_FOREGROUND"
     private val NOTIF_ID = 8801
     private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
@@ -34,10 +55,10 @@ class HavenPacingService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        isServiceRunning = true
         database = HavenDatabase.getInstance(this)
         audioEngine = HavenAudioEngine(this)
 
-        // Indefinite PARTIAL_WAKE_LOCK to prevent Samsung One UI Doze sleep
         val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "HAVEN::PersistentTelemetry")
         wakeLock?.acquire()
@@ -60,7 +81,10 @@ class HavenPacingService : Service() {
             context = this,
             onHeartRateReceived = { hr ->
                 stateMachine.updateHeartRate(hr)
+                latestHr = hr
+                latestMode = stateMachine.mode.name
                 updateNotification("HR: $hr BPM", "State: ${stateMachine.mode.name}")
+                notifyUi()
             },
             onConnectionStatusChanged = { connected, status ->
                 updateNotification("BLE: $status", if (connected) "Active Monitoring" else "Reconnecting...")
@@ -74,7 +98,18 @@ class HavenPacingService : Service() {
     private val tickerRunnable = object : Runnable {
         override fun run() {
             stateMachine.onTick()
+            latestExcursionSec = stateMachine.excursionSeconds
+            latestDailyDebtSec = maxOf(0, stateMachine.dailyTotalSeconds - 300)
+            latestMode = stateMachine.mode.name
+            notifyUi()
             tickerHandler.postDelayed(this, 1000)
+        }
+    }
+
+    private fun notifyUi() {
+        val listener = onTelemetryUpdate ?: return
+        Handler(Looper.getMainLooper()).post {
+            listener(latestHr, latestExcursionSec, latestDailyDebtSec, latestMode)
         }
     }
 
@@ -99,7 +134,6 @@ class HavenPacingService : Service() {
                 val budgetAlert = if (event.budgetSpent) "Budget spent." else ""
                 audioEngine.speak("Settled at ${event.hr}. Excursion ${event.excursionSec} seconds. $budgetAlert")
 
-                // Persist to Room SQLite
                 serviceScope.launch {
                     val record = ExcursionRecord(
                         startTime = excursionStartTime,
@@ -113,7 +147,6 @@ class HavenPacingService : Service() {
                 }
             }
             is TelemetryEvent.ModeChanged -> {
-                // Silently change HUD state without startle audio
                 updateNotification("Mode: ${event.newMode.name}", "HR: ${stateMachine.currentHr} BPM")
             }
         }
@@ -156,6 +189,7 @@ class HavenPacingService : Service() {
     }
 
     override fun onDestroy() {
+        isServiceRunning = false
         tickerHandler.removeCallbacksAndMessages(null)
         bleManager.disconnect()
         audioEngine.shutdown()
