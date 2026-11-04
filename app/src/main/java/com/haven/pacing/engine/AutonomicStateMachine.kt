@@ -40,7 +40,7 @@ class AutonomicStateMachine(
     // Calibrated baseline: 20 minutes (1,200 seconds) cumulative
     private val budgetSec: Int = 1200 
     
-    // 2-Minute Grace Period: zero voice alerts for brief spikes under 120s
+    // 2-Minute Grace Period
     private val gracePeriodSec: Int = 120
     private var alertArmed: Boolean = false
 
@@ -106,7 +106,8 @@ class AutonomicStateMachine(
                     if (mode == CockpitMode.COCKPIT_LIVE) {
                         onEvent(TelemetryEvent.Breach(currentHr))
                     }
-                } else if ((excursionSeconds - gracePeriodSec) % 30 == 0) {
+                // Calm 60-second pacing cadence
+                } else if ((excursionSeconds - gracePeriodSec) % 60 == 0) {
                     val debt = maxOf(0, dailyTotalSeconds - budgetSec)
                     if (mode == CockpitMode.COCKPIT_LIVE) {
                         onEvent(TelemetryEvent.CadenceUpdate(currentHr, excursionSeconds, debt))
@@ -116,7 +117,6 @@ class AutonomicStateMachine(
         } else if (excursionActive && currentHr <= recoveryFloor) {
             // Settlement transition
             val budgetSpent = dailyTotalSeconds >= budgetSec
-            // Only speak debrief if the voice alert was actually triggered
             if (alertArmed && mode == CockpitMode.COCKPIT_LIVE) {
                 onEvent(TelemetryEvent.Settled(currentHr, excursionSeconds, dailyTotalSeconds, budgetSpent))
             }
