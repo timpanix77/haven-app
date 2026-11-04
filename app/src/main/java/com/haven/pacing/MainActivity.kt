@@ -1,157 +1,310 @@
 package com.haven.pacing
 
 import android.Manifest
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
 import android.graphics.Color
-import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.PowerManager
-import android.provider.Settings
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
-import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
 import com.haven.pacing.data.HavenDatabase
 import com.haven.pacing.data.VaultManager
 import com.haven.pacing.service.HavenPacingService
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
 class MainActivity : AppCompatActivity() {
-    private val scope = CoroutineScope(Dispatchers.Main)
-    private lateinit var database: HavenDatabase
-    private lateinit var vaultManager: VaultManager
 
     private lateinit var tvLiveHr: TextView
-    private lateinit var tvExcursion: TextView
-    private lateinit var tvDailyDebt: TextView
+    private lateinit var tvHrStatus: TextView
     private lateinit var tvMode: TextView
+    private lateinit var tvExcursion: TextView
+    private lateinit var tvBudgetRemaining: TextView
+    private lateinit var tvBudgetLabel: TextView
+    private lateinit var tvPaceStatus: TextView
+    private lateinit var tvBufferStatus: TextView
+    private lateinit var tvPeakIndicator: TextView
+    private lateinit var tvStabilityBanner: TextView
     private lateinit var btnArm: Button
+    private lateinit var btnExport: Button
+    private lateinit var btnRestore: Button
 
-    private val filePickerLauncher = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
-        uri?.let { restoreFromUri(it) }
+    private lateinit var vuHr: LedVuMeterView
+    private lateinit var vuBudget: LedVuMeterView
+    private lateinit var vuGrace: LedVuMeterView
+
+    private lateinit var vaultManager: VaultManager
+
+    private var lastRecordedExcursionSec: Int = 0
+
+    private val hudReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == HavenPacingService.ACTION_HUD_UPDATE) {
+                val hr = intent.getIntExtra(HavenPacingService.EXTRA_HR, 0)
+                val mode = intent.getStringExtra(HavenPacingService.EXTRA_MODE) ?: "COCKPIT_LIVE"
+                val excSec = intent.getIntExtra(HavenPacingService.EXTRA_EXCURSION_SEC, 0)
+                val peakHr = intent.getIntExtra(HavenPacingService.EXTRA_PEAK_HR, 0)
+                val totalSec = intent.getIntExtra(HavenPacingService.EXTRA_DAILY_TOTAL_SEC, 0)
+                val budgetSec = intent.getIntExtra(HavenPacingService.EXTRA_BUDGET_SEC, 1200)
+                val stability = intent.getIntExtra(HavenPacingService.EXTRA_STABILITY_SCORE, 75)
+                val ceiling = intent.getIntExtra(HavenPacingService.EXTRA_ACTIVE_CEILING, 88)
+
+                renderTelemetry(hr, excSec, peakHr, totalSec, budgetSec, stability, ceiling, mode)
+            }
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        initViews()
+        vaultManager = VaultManager(this, HavenDatabase.getInstance(this))
+        checkPermissionsAndStartService()
+    }
+
+    private fun initViews() {
         tvLiveHr = findViewById(R.id.tvLiveHr)
-        tvExcursion = findViewById(R.id.tvExcursion)
-        tvDailyDebt = findViewById(R.id.tvDailyDebt)
+        tvHrStatus = findViewById(R.id.tvHrStatus)
         tvMode = findViewById(R.id.tvMode)
-        btnArm = findViewById(R.id.btnArmService)
+        tvExcursion = findViewById(R.id.tvExcursion)
+        tvBudgetRemaining = findViewById(R.id.tvBudgetRemaining)
+        tvBudgetLabel = findViewById(R.id.tvBudgetLabel)
+        tvPaceStatus = findViewById(R.id.tvPaceStatus)
+        tvBufferStatus = findViewById(R.id.tvBufferStatus)
+        tvPeakIndicator = findViewById(R.id.tvPeakIndicator)
+        tvStabilityBanner = findViewById(R.id.tvStabilityBanner)
+        btnArm = findViewById(R.id.btnArm)
+        btnExport = findViewById(R.id.btnExport)
+        btnRestore = findViewById(R.id.btnRestore)
 
-        database = HavenDatabase.getInstance(this)
-        vaultManager = VaultManager(database)
+        vuHr = findViewById(R.id.vuHr)
+        vuBudget = findViewById(R.id.vuBudget)
+        vuGrace = findViewById(R.id.vuGrace)
 
-        requestRequiredPermissions()
-        requestBatteryOptimizationExemption()
+        vuHr.meterType = LedVuMeterView.MeterType.HR_PROXIMITY
+        vuBudget.meterType = LedVuMeterView.MeterType.DAILY_BUDGET
+        vuGrace.meterType = LedVuMeterView.MeterType.GRACE_BUFFER
 
         btnArm.setOnClickListener {
-            val intent = Intent(this, HavenPacingService::class.java)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(intent)
-            } else {
-                startService(intent)
-            }
-            btnArm.text = "ENGINE ACTIVE (ARMED)"
-            btnArm.setTextColor(Color.parseColor("#43A047"))
-            Toast.makeText(this, "HAVEN Foreground Service Armed", Toast.LENGTH_SHORT).show()
+            checkPermissionsAndStartService()
         }
 
-        findViewById<Button>(R.id.btnExportVault).setOnClickListener {
-            scope.launch {
-                val file = vaultManager.exportVault(this@MainActivity)
-                Toast.makeText(this@MainActivity, "Vault Exported: ${file.name}", Toast.LENGTH_LONG).show()
+        btnExport.setOnClickListener {
+            lifecycleScope.launch(Dispatchers.IO) {
+                val file = vaultManager.exportVault()
+                withContext(Dispatchers.Main) {
+                    if (file != null) {
+                        Toast.makeText(this@MainActivity, "Vault Exported: ${file.name}", Toast.LENGTH_LONG).show()
+                    } else {
+                        Toast.makeText(this@MainActivity, "Export Failed", Toast.LENGTH_SHORT).show()
+                    }
+                }
             }
         }
 
-        findViewById<Button>(R.id.btnImportVault).setOnClickListener {
-            filePickerLauncher.launch("application/json")
+        btnRestore.setOnClickListener {
+            Toast.makeText(this, "Place JSON file in Downloads to Restore", Toast.LENGTH_SHORT).show()
         }
     }
 
     override fun onResume() {
         super.onResume()
-        if (HavenPacingService.isServiceRunning) {
-            btnArm.text = "ENGINE ACTIVE (ARMED)"
-            btnArm.setTextColor(Color.parseColor("#43A047"))
+        val filter = IntentFilter(HavenPacingService.ACTION_HUD_UPDATE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(hudReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(hudReceiver, filter)
         }
 
-        // Live 1 Hz subscriber to the running background engine
-        HavenPacingService.onTelemetryUpdate = { hr, excursionSec, debtSec, mode ->
+        // Direct callback fallback
+        HavenPacingService.onTelemetryUpdate = { hr, excSec, totalSec, mode ->
             runOnUiThread {
-                tvLiveHr.text = if (hr > 0) hr.toString() else "--"
-
-                val exM = excursionSec / 60
-                val exS = excursionSec % 60
-                tvExcursion.text = String.format("%02d:%02d", exM, exS)
-
-                val debtM = debtSec / 60
-                val debtS = debtSec % 60
-                tvDailyDebt.text = String.format("%02d:%02d", debtM, debtS)
-
-                if (mode == "COCKPIT_DARK") {
-                    tvMode.text = "[ 🌙 COCKPIT DARK ]"
-                    tvMode.setTextColor(Color.parseColor("#757575"))
-                } else {
-                    tvMode.text = "[ ☀️ COCKPIT LIVE ]"
-                    tvMode.setTextColor(Color.parseColor("#43A047"))
-                }
+                renderTelemetry(hr, excSec, 0, totalSec, 1200, 75, 88, mode)
             }
+        }
+
+        if (HavenPacingService.isServiceRunning) {
+            btnArm.text = "ENGINE ACTIVE (ARMED)"
+            btnArm.setTextColor(Color.parseColor("#00E676"))
         }
     }
 
     override fun onPause() {
         super.onPause()
-        // Unhook UI callback when app is backgrounded to preserve GPU/screen cycles
+        try {
+            unregisterReceiver(hudReceiver)
+        } catch (_: Exception) {}
         HavenPacingService.onTelemetryUpdate = null
     }
 
-    private fun restoreFromUri(uri: Uri) {
-        scope.launch {
-            try {
-                val content = withContext(Dispatchers.IO) {
-                    contentResolver.openInputStream(uri)?.bufferedReader()?.use { it.readText() }
+    private fun renderTelemetry(
+        hr: Int,
+        excSec: Int,
+        peakHr: Int,
+        totalSec: Int,
+        budgetSec: Int,
+        stability: Int,
+        ceiling: Int,
+        mode: String
+    ) {
+        // 1. Live BPM and Proximity Bar
+        if (hr > 0) {
+            tvLiveHr.text = hr.toString()
+            vuHr.setLevel((hr - 40).coerceAtLeast(0).toFloat(), 70f) // 40-110 BPM range
+            when {
+                hr <= 75 -> {
+                    tvLiveHr.setTextColor(Color.parseColor("#00E676"))
+                    tvHrStatus.text = "BPM • FLOOR: RECOVERED (<=75)"
                 }
-                if (content != null) {
-                    vaultManager.importVault(content)
-                    Toast.makeText(this@MainActivity, "Vault Successfully Restored", Toast.LENGTH_SHORT).show()
+                hr < ceiling -> {
+                    tvLiveHr.setTextColor(Color.WHITE)
+                    tvHrStatus.text = "BPM • SAFE ACTIVE ZONE"
                 }
-            } catch (e: Exception) {
-                Toast.makeText(this@MainActivity, "Import Failed: ${e.message}", Toast.LENGTH_SHORT).show()
+                hr < ceiling + 3 -> {
+                    tvLiveHr.setTextColor(Color.parseColor("#FF9100"))
+                    tvHrStatus.text = "BPM • CEILING WARNING"
+                }
+                else -> {
+                    tvLiveHr.setTextColor(Color.parseColor("#FF1744"))
+                    tvHrStatus.text = "BPM • CEILING BREACH ($ceiling)"
+                }
             }
+        } else {
+            tvLiveHr.text = "--"
+            tvLiveHr.setTextColor(Color.parseColor("#8E8E93"))
         }
-    }
 
-    private fun requestRequiredPermissions() {
-        val permissions = mutableListOf(
-            Manifest.permission.BLUETOOTH_SCAN,
-            Manifest.permission.BLUETOOTH_CONNECT,
-            Manifest.permission.FOREGROUND_SERVICE,
-            Manifest.permission.POST_NOTIFICATIONS
+        // 2. Peak Hold Readout
+        if (peakHr > 0) {
+            tvPeakIndicator.text = "PEAK: $peakHr BPM"
+        }
+
+        // 3. Excursion Stopwatch & Latched Settlement
+        if (excSec > 0) {
+            lastRecordedExcursionSec = excSec
+            val m = excSec / 60
+            val s = excSec % 60
+            tvExcursion.text = String.format("%02d:%02d", m, s)
+            tvExcursion.setTextColor(Color.parseColor("#FF9100"))
+
+            // Grace buffer meter: active count out of 120s
+            vuGrace.setLevel(excSec.coerceAtMost(120).toFloat(), 120f)
+            val remainingGrace = (120 - excSec).coerceAtLeast(0)
+            tvBufferStatus.text = "ACTIVE (${remainingGrace}s LEFT)"
+            tvBufferStatus.setTextColor(Color.parseColor("#FF9100"))
+        } else {
+            val m = lastRecordedExcursionSec / 60
+            val s = lastRecordedExcursionSec % 60
+            tvExcursion.text = String.format("%02d:%02d", m, s)
+            tvExcursion.setTextColor(Color.WHITE)
+
+            vuGrace.setLevel(0f, 120f)
+            tvBufferStatus.text = "STANDBY"
+            tvBufferStatus.setTextColor(Color.parseColor("#636366"))
+        }
+
+        // 4. Budget Burn & Remaining Time
+        val budgetMin = budgetSec / 60
+        tvBudgetLabel.text = "DAILY BUDGET (${budgetMin}m CAP)"
+        vuBudget.setLevel(totalSec.toFloat(), budgetSec.toFloat())
+
+        val remainingSec = budgetSec - totalSec
+        if (remainingSec >= 0) {
+            val rM = remainingSec / 60
+            val rS = remainingSec % 60
+            tvBudgetRemaining.text = String.format("%02d:%02d", rM, rS)
+            tvBudgetRemaining.setTextColor(Color.parseColor("#00E676"))
+            tvPaceStatus.text = "PACE: ON TRACK"
+            tvPaceStatus.setTextColor(Color.parseColor("#00E676"))
+        } else {
+            val debtSec = -remainingSec
+            val dM = debtSec / 60
+            val dS = debtSec % 60
+            tvBudgetRemaining.text = String.format("-%02d:%02d", dM, dS)
+            tvBudgetRemaining.setTextColor(Color.parseColor("#FF1744"))
+            tvPaceStatus.text = "PACE: OVER BUDGET"
+            tvPaceStatus.setTextColor(Color.parseColor("#FF1744"))
+        }
+
+        // 5. Morning Stability Panel (0-100)
+        val stabilityTier = when {
+            stability >= 85 -> "[OPTIMAL]"
+            stability >= 70 -> "[STABLE]"
+            stability >= 50 -> "[GUARDED]"
+            stability >= 30 -> "[VULNERABLE]"
+            else            -> "[VETO / CRASH]"
+        }
+        tvStabilityBanner.text = "STABILITY: $stability/100 $stabilityTier | CEIL: $ceiling | BUD: ${budgetMin}m"
+        tvStabilityBanner.setTextColor(
+            when {
+                stability >= 70 -> Color.parseColor("#00E676")
+                stability >= 50 -> Color.parseColor("#FFEA00")
+                stability >= 30 -> Color.parseColor("#FF9100")
+                else            -> Color.parseColor("#FF1744")
+            }
         )
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            permissions.add(Manifest.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE)
+
+        // 6. Cockpit Mode
+        if (mode == "COCKPIT_DARK") {
+            tvMode.text = "[ 🌙 COCKPIT DARK ]"
+            tvMode.setTextColor(Color.parseColor("#757575"))
+        } else {
+            tvMode.text = "[ ☀️ COCKPIT LIVE ]"
+            tvMode.setTextColor(Color.parseColor("#00E676"))
         }
-        ActivityCompat.requestPermissions(this, permissions.toTypedArray(), 101)
     }
 
-    private fun requestBatteryOptimizationExemption() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
-            val pm = getSystemService(POWER_SERVICE) as PowerManager
-            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
-                val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
-                    data = Uri.parse("package:$packageName")
-                }
-                startActivity(intent)
-            }
+    private fun checkPermissionsAndStartService() {
+        val permissions = mutableListOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        )
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            permissions.add(Manifest.permission.BLUETOOTH_SCAN)
+            permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
         }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+
+        val missing = permissions.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+
+        if (missing.isNotEmpty()) {
+            ActivityCompat.requestPermissions(this, missing.toTypedArray(), 101)
+        } else {
+            startHavenService()
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
+            startHavenService()
+        }
+    }
+
+    private fun startHavenService() {
+        val serviceIntent = Intent(this, HavenPacingService::class.java)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(serviceIntent)
+        } else {
+            startService(serviceIntent)
+        }
+        btnArm.text = "ENGINE ACTIVE (ARMED)"
+        btnArm.setTextColor(Color.parseColor("#00E676"))
     }
 }
