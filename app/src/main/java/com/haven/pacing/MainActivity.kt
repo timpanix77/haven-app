@@ -2,6 +2,7 @@ package com.haven.pacing
 
 import android.Manifest
 import android.content.Intent
+import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
@@ -26,6 +27,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var database: HavenDatabase
     private lateinit var vaultManager: VaultManager
 
+    private lateinit var tvLiveHr: TextView
+    private lateinit var tvExcursion: TextView
+    private lateinit var tvDailyDebt: TextView
+    private lateinit var tvMode: TextView
+    private lateinit var btnArm: Button
+
     private val filePickerLauncher = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         uri?.let { restoreFromUri(it) }
     }
@@ -34,19 +41,27 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 
+        tvLiveHr = findViewById(R.id.tvLiveHr)
+        tvExcursion = findViewById(R.id.tvExcursion)
+        tvDailyDebt = findViewById(R.id.tvDailyDebt)
+        tvMode = findViewById(R.id.tvMode)
+        btnArm = findViewById(R.id.btnArmService)
+
         database = HavenDatabase.getInstance(this)
         vaultManager = VaultManager(database)
 
         requestRequiredPermissions()
         requestBatteryOptimizationExemption()
 
-        findViewById<Button>(R.id.btnArmService).setOnClickListener {
+        btnArm.setOnClickListener {
             val intent = Intent(this, HavenPacingService::class.java)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 startForegroundService(intent)
             } else {
                 startService(intent)
             }
+            btnArm.text = "ENGINE ACTIVE (ARMED)"
+            btnArm.setTextColor(Color.parseColor("#43A047"))
             Toast.makeText(this, "HAVEN Foreground Service Armed", Toast.LENGTH_SHORT).show()
         }
 
@@ -60,6 +75,43 @@ class MainActivity : AppCompatActivity() {
         findViewById<Button>(R.id.btnImportVault).setOnClickListener {
             filePickerLauncher.launch("application/json")
         }
+    }
+
+    override fun onResume() {
+        super.onResume()
+        if (HavenPacingService.isServiceRunning) {
+            btnArm.text = "ENGINE ACTIVE (ARMED)"
+            btnArm.setTextColor(Color.parseColor("#43A047"))
+        }
+
+        // Live 1 Hz subscriber to the running background engine
+        HavenPacingService.onTelemetryUpdate = { hr, excursionSec, debtSec, mode ->
+            runOnUiThread {
+                tvLiveHr.text = if (hr > 0) hr.toString() else "--"
+
+                val exM = excursionSec / 60
+                val exS = excursionSec % 60
+                tvExcursion.text = String.format("%02d:%02d", exM, exS)
+
+                val debtM = debtSec / 60
+                val debtS = debtSec % 60
+                tvDailyDebt.text = String.format("%02d:%02d", debtM, debtS)
+
+                if (mode == "COCKPIT_DARK") {
+                    tvMode.text = "[ 🌙 COCKPIT DARK ]"
+                    tvMode.setTextColor(Color.parseColor("#757575"))
+                } else {
+                    tvMode.text = "[ ☀️ COCKPIT LIVE ]"
+                    tvMode.setTextColor(Color.parseColor("#43A047"))
+                }
+            }
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        // Unhook UI callback when app is backgrounded to preserve GPU/screen cycles
+        HavenPacingService.onTelemetryUpdate = null
     }
 
     private fun restoreFromUri(uri: Uri) {
