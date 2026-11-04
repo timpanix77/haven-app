@@ -28,5 +28,8 @@ abstract class HavenDatabase : RoomDatabase() {
                 instance
             }
         }
+
+        // Alias for MainActivity compatibility
+        fun getInstance(context: Context): HavenDatabase = getDatabase(context)
     }
 }
