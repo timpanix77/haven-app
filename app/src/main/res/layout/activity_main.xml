@@ -60,7 +60,7 @@
             android:id="@+id/tvHrStatus"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="BPM • FLOOR: <=75"
+            android:text="BPM • FLOOR: &lt;=75"
             android:textColor="#8E8E93"
             android:textSize="12sp"
             android:fontFamily="monospace" />
@@ -281,19 +281,3 @@
             android:text="EXPORT VAULT"
             android:textColor="#8E8E93"
             android:textSize="11sp"
-            android:fontFamily="monospace" />
-
-        <Button
-            android:id="@+id/btnRestore"
-            android:layout_width="0dp"
-            android:layout_height="44dp"
-            android:layout_marginStart="4dp"
-            android:layout_weight="1"
-            android:backgroundTint="#161618"
-            android:text="RESTORE VAULT"
-            android:textColor="#8E8E93"
-            android:textSize="11sp"
-            android:fontFamily="monospace" />
-    </LinearLayout>
-
-</LinearLayout>
