@@ -1,5 +1,7 @@
 package com.haven.pacing.engine
 
+import java.util.Calendar
+
 enum class CockpitMode {
     COCKPIT_LIVE,
     COCKPIT_DARK
@@ -34,7 +36,11 @@ class AutonomicStateMachine(
 
     private var timeBelowFloorSec: Int = 0
     private var timeAboveWakeSec: Int = 0
-    private val budgetSec: Int = 300 // 5 minutes standard baseline
+    
+    // Calibrated to Visible's 18-month baseline: 20 minutes (1,200 seconds) cumulative
+    private val budgetSec: Int = 1200 
+    
+    private var currentPacingDay: Int = getCurrentPacingDay()
 
     var excursionPeakHr: Int = 0
         private set
@@ -46,6 +52,13 @@ class AutonomicStateMachine(
 
     fun onTick() {
         if (currentHr <= 0) return
+
+        // 4:00 AM Visible-style Day Rollover Check
+        val todayPacingDay = getCurrentPacingDay()
+        if (todayPacingDay != currentPacingDay) {
+            currentPacingDay = todayPacingDay
+            dailyTotalSeconds = 0 // Clean daily reset at 4 AM
+        }
 
         // Autonomic Rest Transition: 10 continuous minutes (600s) <= recoveryFloor
         if (currentHr <= recoveryFloor) {
@@ -109,5 +122,17 @@ class AutonomicStateMachine(
 
     fun setDailyStartingTotal(seconds: Int) {
         dailyTotalSeconds = seconds
+    }
+
+    /**
+     * Visible-style 4:00 AM Pacing Day partition.
+     * Hours 00:00 to 03:59 belong to the previous calendar day's pacing ledger.
+     */
+    private fun getCurrentPacingDay(): Int {
+        val cal = Calendar.getInstance()
+        if (cal.get(Calendar.HOUR_OF_DAY) < 4) {
+            cal.add(Calendar.DAY_OF_YEAR, -1)
+        }
+        return cal.get(Calendar.DAY_OF_YEAR)
     }
 }
