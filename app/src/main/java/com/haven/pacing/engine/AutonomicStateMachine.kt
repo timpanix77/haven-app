@@ -37,9 +37,13 @@ class AutonomicStateMachine(
     private var timeBelowFloorSec: Int = 0
     private var timeAboveWakeSec: Int = 0
     
-    // Calibrated to Visible's 18-month baseline: 20 minutes (1,200 seconds) cumulative
+    // Calibrated baseline: 20 minutes (1,200 seconds) cumulative
     private val budgetSec: Int = 1200 
     
+    // 2-Minute Grace Period: zero voice alerts for brief spikes under 120s
+    private val gracePeriodSec: Int = 120
+    private var alertArmed: Boolean = false
+
     private var currentPacingDay: Int = getCurrentPacingDay()
 
     var excursionPeakHr: Int = 0
@@ -53,11 +57,11 @@ class AutonomicStateMachine(
     fun onTick() {
         if (currentHr <= 0) return
 
-        // 4:00 AM Visible-style Day Rollover Check
+        // 4:00 AM Visible-style Day Rollover
         val todayPacingDay = getCurrentPacingDay()
         if (todayPacingDay != currentPacingDay) {
             currentPacingDay = todayPacingDay
-            dailyTotalSeconds = 0 // Clean daily reset at 4 AM
+            dailyTotalSeconds = 0
         }
 
         // Autonomic Rest Transition: 10 continuous minutes (600s) <= recoveryFloor
@@ -85,9 +89,7 @@ class AutonomicStateMachine(
                 excursionSeconds = 0
                 excursionPeakHr = currentHr
                 currentExcursionStrain = 0.0
-                if (mode == CockpitMode.COCKPIT_LIVE) {
-                    onEvent(TelemetryEvent.Breach(currentHr))
-                }
+                alertArmed = false
             }
 
             if (currentHr > excursionPeakHr) excursionPeakHr = currentHr
@@ -97,22 +99,31 @@ class AutonomicStateMachine(
             // Accumulate instantaneous quadratic strain
             currentExcursionStrain += pemModel.calculateInstantaneousStrain(currentHr, activeCeiling, recoveryFloor)
 
-            // Cadence update every 30s while in breach
-            if (excursionSeconds % 30 == 0) {
-                val debt = maxOf(0, dailyTotalSeconds - budgetSec)
-                if (mode == CockpitMode.COCKPIT_LIVE) {
-                    onEvent(TelemetryEvent.CadenceUpdate(currentHr, excursionSeconds, debt))
+            // Trigger voice alert ONLY after grace period (120s) has elapsed
+            if (excursionSeconds >= gracePeriodSec) {
+                if (!alertArmed) {
+                    alertArmed = true
+                    if (mode == CockpitMode.COCKPIT_LIVE) {
+                        onEvent(TelemetryEvent.Breach(currentHr))
+                    }
+                } else if ((excursionSeconds - gracePeriodSec) % 30 == 0) {
+                    val debt = maxOf(0, dailyTotalSeconds - budgetSec)
+                    if (mode == CockpitMode.COCKPIT_LIVE) {
+                        onEvent(TelemetryEvent.CadenceUpdate(currentHr, excursionSeconds, debt))
+                    }
                 }
             }
         } else if (excursionActive && currentHr <= recoveryFloor) {
             // Settlement transition
             val budgetSpent = dailyTotalSeconds >= budgetSec
-            if (mode == CockpitMode.COCKPIT_LIVE) {
+            // Only speak debrief if the voice alert was actually triggered
+            if (alertArmed && mode == CockpitMode.COCKPIT_LIVE) {
                 onEvent(TelemetryEvent.Settled(currentHr, excursionSeconds, dailyTotalSeconds, budgetSpent))
             }
             excursionActive = false
             excursionSeconds = 0
             currentExcursionStrain = 0.0
+            alertArmed = false
         }
     }
 
@@ -124,10 +135,6 @@ class AutonomicStateMachine(
         dailyTotalSeconds = seconds
     }
 
-    /**
-     * Visible-style 4:00 AM Pacing Day partition.
-     * Hours 00:00 to 03:59 belong to the previous calendar day's pacing ledger.
-     */
     private fun getCurrentPacingDay(): Int {
         val cal = Calendar.getInstance()
         if (cal.get(Calendar.HOUR_OF_DAY) < 4) {
