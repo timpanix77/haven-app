@@ -69,7 +69,7 @@ class MainActivity : AppCompatActivity() {
         setContentView(R.layout.activity_main)
 
         initViews()
-        vaultManager = VaultManager(this, HavenDatabase.getInstance(this))
+        vaultManager = VaultManager(HavenDatabase.getInstance(this))
         checkPermissionsAndStartService()
     }
 
@@ -102,7 +102,7 @@ class MainActivity : AppCompatActivity() {
 
         btnExport.setOnClickListener {
             lifecycleScope.launch(Dispatchers.IO) {
-                val file = vaultManager.exportVault()
+                val file = vaultManager.exportVault(this@MainActivity)
                 withContext(Dispatchers.Main) {
                     if (file != null) {
                         Toast.makeText(this@MainActivity, "Vault Exported: ${file.name}", Toast.LENGTH_LONG).show()
@@ -127,7 +127,6 @@ class MainActivity : AppCompatActivity() {
             registerReceiver(hudReceiver, filter)
         }
 
-        // Direct callback fallback
         HavenPacingService.onTelemetryUpdate = { hr, excSec, totalSec, mode ->
             runOnUiThread {
                 renderTelemetry(hr, excSec, 0, totalSec, 1200, 75, 88, mode)
@@ -165,19 +164,19 @@ class MainActivity : AppCompatActivity() {
             when {
                 hr <= 75 -> {
                     tvLiveHr.setTextColor(Color.parseColor("#00E676"))
-                    tvHrStatus.text = "BPM • FLOOR: RECOVERED (<=75)"
+                    tvHrStatus.text = "BPM / FLOOR: RECOVERED (<=75)"
                 }
                 hr < ceiling -> {
                     tvLiveHr.setTextColor(Color.WHITE)
-                    tvHrStatus.text = "BPM • SAFE ACTIVE ZONE"
+                    tvHrStatus.text = "BPM / SAFE ACTIVE ZONE"
                 }
                 hr < ceiling + 3 -> {
                     tvLiveHr.setTextColor(Color.parseColor("#FF9100"))
-                    tvHrStatus.text = "BPM • CEILING WARNING"
+                    tvHrStatus.text = "BPM / CEILING WARNING"
                 }
                 else -> {
                     tvLiveHr.setTextColor(Color.parseColor("#FF1744"))
-                    tvHrStatus.text = "BPM • CEILING BREACH ($ceiling)"
+                    tvHrStatus.text = "BPM / CEILING BREACH ($ceiling)"
                 }
             }
         } else {
@@ -198,7 +197,6 @@ class MainActivity : AppCompatActivity() {
             tvExcursion.text = String.format("%02d:%02d", m, s)
             tvExcursion.setTextColor(Color.parseColor("#FF9100"))
 
-            // Grace buffer meter: active count out of 120s
             vuGrace.setLevel(excSec.coerceAtMost(120).toFloat(), 120f)
             val remainingGrace = (120 - excSec).coerceAtLeast(0)
             tvBufferStatus.text = "ACTIVE (${remainingGrace}s LEFT)"
@@ -223,88 +221,4 @@ class MainActivity : AppCompatActivity() {
         if (remainingSec >= 0) {
             val rM = remainingSec / 60
             val rS = remainingSec % 60
-            tvBudgetRemaining.text = String.format("%02d:%02d", rM, rS)
-            tvBudgetRemaining.setTextColor(Color.parseColor("#00E676"))
-            tvPaceStatus.text = "PACE: ON TRACK"
-            tvPaceStatus.setTextColor(Color.parseColor("#00E676"))
-        } else {
-            val debtSec = -remainingSec
-            val dM = debtSec / 60
-            val dS = debtSec % 60
-            tvBudgetRemaining.text = String.format("-%02d:%02d", dM, dS)
-            tvBudgetRemaining.setTextColor(Color.parseColor("#FF1744"))
-            tvPaceStatus.text = "PACE: OVER BUDGET"
-            tvPaceStatus.setTextColor(Color.parseColor("#FF1744"))
-        }
-
-        // 5. Morning Stability Panel (0-100)
-        val stabilityTier = when {
-            stability >= 85 -> "[OPTIMAL]"
-            stability >= 70 -> "[STABLE]"
-            stability >= 50 -> "[GUARDED]"
-            stability >= 30 -> "[VULNERABLE]"
-            else            -> "[VETO / CRASH]"
-        }
-        tvStabilityBanner.text = "STABILITY: $stability/100 $stabilityTier | CEIL: $ceiling | BUD: ${budgetMin}m"
-        tvStabilityBanner.setTextColor(
-            when {
-                stability >= 70 -> Color.parseColor("#00E676")
-                stability >= 50 -> Color.parseColor("#FFEA00")
-                stability >= 30 -> Color.parseColor("#FF9100")
-                else            -> Color.parseColor("#FF1744")
-            }
-        )
-
-        // 6. Cockpit Mode
-        if (mode == "COCKPIT_DARK") {
-            tvMode.text = "[ 🌙 COCKPIT DARK ]"
-            tvMode.setTextColor(Color.parseColor("#757575"))
-        } else {
-            tvMode.text = "[ ☀️ COCKPIT LIVE ]"
-            tvMode.setTextColor(Color.parseColor("#00E676"))
-        }
-    }
-
-    private fun checkPermissionsAndStartService() {
-        val permissions = mutableListOf(
-            Manifest.permission.ACCESS_FINE_LOCATION,
-            Manifest.permission.ACCESS_COARSE_LOCATION
-        )
-
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            permissions.add(Manifest.permission.BLUETOOTH_SCAN)
-            permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
-        }
-
-        val missing = permissions.filter {
-            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
-        }
-
-        if (missing.isNotEmpty()) {
-            ActivityCompat.requestPermissions(this, missing.toTypedArray(), 101)
-        } else {
-            startHavenService()
-        }
-    }
-
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
-            startHavenService()
-        }
-    }
-
-    private fun startHavenService() {
-        val serviceIntent = Intent(this, HavenPacingService::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(serviceIntent)
-        } else {
-            startService(serviceIntent)
-        }
-        btnArm.text = "ENGINE ACTIVE (ARMED)"
-        btnArm.setTextColor(Color.parseColor("#00E676"))
-    }
-}
+            tvBudgetRemaining.text = String
