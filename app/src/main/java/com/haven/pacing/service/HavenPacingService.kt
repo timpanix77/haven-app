@@ -131,9 +131,7 @@ class HavenPacingService : Service() {
             }
             is TelemetryEvent.Settled -> {
                 val endTime = System.currentTimeMillis()
-                val budgetAlert = if (event.budgetSpent) "Budget spent." else ""
-                audioEngine.speak("Settled at ${event.hr}. Excursion ${event.excursionSec} seconds. $budgetAlert")
-
+               audioEngine.speak("Settled at ${event.hr}. Excursion ${event.excursionSec} seconds.")
                 serviceScope.launch {
                     val record = ExcursionRecord(
                         startTime = excursionStartTime,
