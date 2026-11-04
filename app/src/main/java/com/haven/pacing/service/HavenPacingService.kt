@@ -55,6 +55,10 @@ class HavenPacingService : Service() {
         val HEART_RATE_SERVICE_UUID: UUID = UUID.fromString("0000180d-0000-1000-8000-00805f9b34fb")
         val HEART_RATE_MEASUREMENT_CHAR_UUID: UUID = UUID.fromString("00002a37-0000-1000-8000-00805f9b34fb")
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+
+        // Direct subscribers for MainActivity
+        var isServiceRunning: Boolean = false
+        var onTelemetryUpdate: ((hr: Int, excursionSec: Int, debtSec: Int, mode: String) -> Unit)? = null
     }
 
     private val serviceJob = SupervisorJob()
@@ -72,6 +76,15 @@ class HavenPacingService : Service() {
         override fun run() {
             stateMachine.onTick()
             broadcastHudUpdate()
+            
+            // Dispatch direct 1Hz telemetry update to MainActivity
+            onTelemetryUpdate?.invoke(
+                stateMachine.currentHr,
+                stateMachine.excursionSeconds,
+                stateMachine.dailyTotalSeconds,
+                stateMachine.mode.name
+            )
+
             updateForegroundNotification()
             tickerHandler.postDelayed(this, 1000)
         }
@@ -79,6 +92,7 @@ class HavenPacingService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        isServiceRunning = true
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification("Starting telemetry..."))
 
@@ -119,7 +133,7 @@ class HavenPacingService : Service() {
                 broadcastHudUpdate()
             }
             is TelemetryEvent.Settled -> {
-                // 1. Decoupled Persistence: Log every excursion to SQLite silently
+                // 1. Silent Vault Persistence: Log every excursion to SQLite
                 serviceScope.launch(Dispatchers.IO) {
                     val record = ExcursionRecord(
                         timestamp = System.currentTimeMillis(),
@@ -301,6 +315,8 @@ class HavenPacingService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        isServiceRunning = false
+        onTelemetryUpdate = null
         tickerHandler.removeCallbacks(tickerRunnable)
         serviceJob.cancel()
         bluetoothGatt?.close()
