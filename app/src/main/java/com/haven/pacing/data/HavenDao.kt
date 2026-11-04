@@ -19,6 +19,18 @@ interface HavenDao {
     @Query("SELECT * FROM excursion_records ORDER BY timestamp DESC")
     suspend fun getAllExcursions(): List<ExcursionRecord>
 
+    @Query("SELECT * FROM excursion_records ORDER BY timestamp ASC")
+    suspend fun exportAllExcursions(): List<ExcursionRecord>
+
+    @Query("SELECT * FROM daily_autonomic_ledgers")
+    suspend fun exportAllLedgers(): List<DailyAutonomicLedger>
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun importExcursions(records: List<ExcursionRecord>)
+
+    @Insert(onConflict = OnConflictStrategy.REPLACE)
+    suspend fun importLedgers(ledgers: List<DailyAutonomicLedger>)
+
     @Query("DELETE FROM excursion_records")
     suspend fun clearAll()
 }
