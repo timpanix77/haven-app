@@ -2,48 +2,49 @@
 <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
     android:layout_width="match_parent"
     android:layout_height="match_parent"
+    android:background="#0A0A0A"
     android:orientation="vertical"
-    android:background="#000000"
-    android:padding="20dp"
-    android:weightSum="10">
+    android:padding="20dp">
 
+    <!-- AVIONICS HEADER -->
     <TextView
-        android:id="@+id/tvTitle"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="HAVEN AUTONOMIC FLIGHT DECK"
-        android:textColor="#757575"
-        android:textSize="12sp"
-        android:letterSpacing="0.15"
         android:gravity="center"
-        android:fontFamily="monospace"/>
+        android:text="HAVEN AUTONOMIC FLIGHT DECK"
+        android:textColor="#8E8E93"
+        android:textSize="12sp"
+        android:fontFamily="monospace"
+        android:letterSpacing="0.15" />
 
     <TextView
         android:id="@+id/tvMode"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:text="[ ☀️ COCKPIT LIVE ]"
-        android:textColor="#43A047"
-        android:textSize="14sp"
-        android:textStyle="bold"
+        android:layout_marginTop="4dp"
         android:gravity="center"
+        android:text="[ ☀️ COCKPIT LIVE ]"
+        android:textColor="#00E676"
+        android:textSize="14sp"
         android:fontFamily="monospace"
-        android:layout_marginTop="8dp"/>
+        android:textStyle="bold" />
 
+    <!-- LIVE PRIMARY TELEMETRY READOUT -->
     <LinearLayout
         android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="5"
-        android:orientation="vertical"
-        android:gravity="center">
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:gravity="center"
+        android:orientation="vertical">
 
         <TextView
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
             android:text="LIVE TELEMETRY"
-            android:textColor="#757575"
-            android:textSize="12sp"
-            android:fontFamily="monospace"/>
+            android:textColor="#636366"
+            android:textSize="11sp"
+            android:fontFamily="monospace"
+            android:letterSpacing="0.1" />
 
         <TextView
             android:id="@+id/tvLiveHr"
@@ -51,125 +52,248 @@
             android:layout_height="wrap_content"
             android:text="--"
             android:textColor="#FFFFFF"
-            android:textSize="96sp"
+            android:textSize="72sp"
             android:textStyle="bold"
-            android:fontFamily="monospace"/>
+            android:fontFamily="monospace" />
 
         <TextView
+            android:id="@+id/tvHrStatus"
             android:layout_width="wrap_content"
             android:layout_height="wrap_content"
-            android:text="BPM"
-            android:textColor="#757575"
-            android:textSize="14sp"
-            android:fontFamily="monospace"/>
+            android:text="BPM • FLOOR: <=75"
+            android:textColor="#8E8E93"
+            android:textSize="12sp"
+            android:fontFamily="monospace" />
     </LinearLayout>
 
+    <!-- CHANNEL 1: LIVE HR PROXIMITY METER -->
     <LinearLayout
         android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="2"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:orientation="vertical">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="HR SIGNAL [40-110 BPM]"
+                android:textColor="#8E8E93"
+                android:textSize="10sp"
+                android:fontFamily="monospace" />
+            <TextView
+                android:id="@+id/tvPeakIndicator"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="PEAK: --"
+                android:textColor="#FF1744"
+                android:textSize="10sp"
+                android:fontFamily="monospace" />
+        </LinearLayout>
+
+        <com.haven.pacing.LedVuMeterView
+            android:id="@+id/vuHr"
+            android:layout_width="match_parent"
+            android:layout_height="14dp"
+            android:layout_marginTop="4dp" />
+    </LinearLayout>
+
+    <!-- CHANNEL 2: DAILY BUDGET BURN METER -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:orientation="vertical">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+            <TextView
+                android:id="@+id/tvBudgetLabel"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="DAILY BUDGET (20m CAP)"
+                android:textColor="#8E8E93"
+                android:textSize="10sp"
+                android:fontFamily="monospace" />
+            <TextView
+                android:id="@+id/tvPaceStatus"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="PACE: ON TRACK"
+                android:textColor="#00E676"
+                android:textSize="10sp"
+                android:fontFamily="monospace" />
+        </LinearLayout>
+
+        <com.haven.pacing.LedVuMeterView
+            android:id="@+id/vuBudget"
+            android:layout_width="match_parent"
+            android:layout_height="14dp"
+            android:layout_marginTop="4dp" />
+    </LinearLayout>
+
+    <!-- CHANNEL 3: 2-MINUTE GRACE BUFFER METER -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:orientation="vertical">
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+            <TextView
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="GRACE BUFFER (120s)"
+                android:textColor="#8E8E93"
+                android:textSize="10sp"
+                android:fontFamily="monospace" />
+            <TextView
+                android:id="@+id/tvBufferStatus"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="STANDBY"
+                android:textColor="#636366"
+                android:textSize="10sp"
+                android:fontFamily="monospace" />
+        </LinearLayout>
+
+        <com.haven.pacing.LedVuMeterView
+            android:id="@+id/vuGrace"
+            android:layout_width="match_parent"
+            android:layout_height="10dp"
+            android:layout_marginTop="4dp" />
+    </LinearLayout>
+
+    <!-- TELEMETRY METRIC CARDS -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:background="#161618"
         android:orientation="horizontal"
-        android:weightSum="2"
-        android:background="#111111"
         android:padding="12dp">
 
         <LinearLayout
             android:layout_width="0dp"
-            android:layout_height="match_parent"
+            android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:orientation="vertical"
-            android:gravity="center">
+            android:gravity="center"
+            android:orientation="vertical">
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="EXCURSION"
-                android:textColor="#757575"
-                android:textSize="11sp"
-                android:fontFamily="monospace"/>
+                android:text="LAST EXCURSION"
+                android:textColor="#8E8E93"
+                android:textSize="10sp"
+                android:fontFamily="monospace" />
             <TextView
                 android:id="@+id/tvExcursion"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
+                android:layout_marginTop="4dp"
                 android:text="00:00"
                 android:textColor="#FFFFFF"
-                android:textSize="24sp"
+                android:textSize="22sp"
                 android:textStyle="bold"
-                android:fontFamily="monospace"/>
+                android:fontFamily="monospace" />
         </LinearLayout>
+
+        <View
+            android:layout_width="1dp"
+            android:layout_height="match_parent"
+            android:background="#2C2C2E" />
 
         <LinearLayout
             android:layout_width="0dp"
-            android:layout_height="match_parent"
+            android:layout_height="wrap_content"
             android:layout_weight="1"
-            android:orientation="vertical"
-            android:gravity="center">
+            android:gravity="center"
+            android:orientation="vertical">
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="DAILY DEBT"
-                android:textColor="#757575"
-                android:textSize="11sp"
-                android:fontFamily="monospace"/>
+                android:text="BUDGET REMAINING"
+                android:textColor="#8E8E93"
+                android:textSize="10sp"
+                android:fontFamily="monospace" />
             <TextView
-                android:id="@+id/tvDailyDebt"
+                android:id="@+id/tvBudgetRemaining"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
-                android:text="00:00"
-                android:textColor="#FFB300"
-                android:textSize="24sp"
+                android:layout_marginTop="4dp"
+                android:text="20:00"
+                android:textColor="#00E676"
+                android:textSize="22sp"
                 android:textStyle="bold"
-                android:fontFamily="monospace"/>
+                android:fontFamily="monospace" />
         </LinearLayout>
     </LinearLayout>
+
+    <!-- 0-100 MORNING STABILITY PANEL -->
+    <TextView
+        android:id="@+id/tvStabilityBanner"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="12dp"
+        android:background="#161618"
+        android:gravity="center"
+        android:padding="10dp"
+        android:text="STABILITY: 75/100 [STABLE] | CEIL: 88 | BUD: 20m"
+        android:textColor="#00E676"
+        android:textSize="11sp"
+        android:fontFamily="monospace" />
+
+    <!-- CONTROLS & VAULT FOOTER -->
+    <Button
+        android:id="@+id/btnArm"
+        android:layout_width="match_parent"
+        android:layout_height="48dp"
+        android:layout_marginTop="16dp"
+        android:backgroundTint="#1C1C1E"
+        android:text="ENGINE ACTIVE (ARMED)"
+        android:textColor="#00E676"
+        android:fontFamily="monospace" />
 
     <LinearLayout
         android:layout_width="match_parent"
-        android:layout_height="0dp"
-        android:layout_weight="3"
-        android:orientation="vertical"
-        android:gravity="bottom"
-        android:paddingTop="10dp">
+        android:layout_height="wrap_content"
+        android:layout_marginTop="8dp"
+        android:orientation="horizontal">
 
         <Button
-            android:id="@+id/btnArmService"
-            android:layout_width="match_parent"
-            android:layout_height="55dp"
-            android:text="ARM 24/7 PACING ENGINE"
-            android:backgroundTint="#222222"
-            android:textColor="#43A047"
-            android:fontFamily="monospace"
-            android:textStyle="bold"/>
+            android:id="@+id/btnExport"
+            android:layout_width="0dp"
+            android:layout_height="44dp"
+            android:layout_marginEnd="4dp"
+            android:layout_weight="1"
+            android:backgroundTint="#161618"
+            android:text="EXPORT VAULT"
+            android:textColor="#8E8E93"
+            android:textSize="11sp"
+            android:fontFamily="monospace" />
 
-        <LinearLayout
-            android:layout_width="match_parent"
-            android:layout_height="wrap_content"
-            android:orientation="horizontal"
-            android:weightSum="2"
-            android:layout_marginTop="8dp">
-
-            <Button
-                android:id="@+id/btnExportVault"
-                android:layout_width="0dp"
-                android:layout_height="48dp"
-                android:layout_weight="1"
-                android:text="EXPORT VAULT"
-                android:backgroundTint="#161616"
-                android:textColor="#CCCCCC"
-                android:textSize="11sp"
-                android:fontFamily="monospace"
-                android:layout_marginEnd="4dp"/>
-
-            <Button
-                android:id="@+id/btnImportVault"
-                android:layout_width="0dp"
-                android:layout_height="48dp"
-                android:layout_weight="1"
-                android:text="RESTORE VAULT"
-                android:backgroundTint="#161616"
-                android:textColor="#CCCCCC"
-                android:textSize="11sp"
-                android:fontFamily="monospace"
-                android:layout_marginStart="4dp"/>
-        </LinearLayout>
+        <Button
+            android:id="@+id/btnRestore"
+            android:layout_width="0dp"
+            android:layout_height="44dp"
+            android:layout_marginStart="4dp"
+            android:layout_weight="1"
+            android:backgroundTint="#161618"
+            android:text="RESTORE VAULT"
+            android:textColor="#8E8E93"
+            android:textSize="11sp"
+            android:fontFamily="monospace" />
     </LinearLayout>
+
 </LinearLayout>
