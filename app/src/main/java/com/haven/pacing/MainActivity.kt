@@ -46,7 +46,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var vaultManager: VaultManager
     private var lastRecordedExcursionSec: Int = 0
 
-    // Indefinite Latched Peak Memory for POTS visual anchoring
+    // Indefinite Latched Peak Memory for POTS visual reminders
     private var latchedPeakHr: Int = 0
     private var currentSurgePeakHr: Int = 0
 
@@ -95,7 +95,7 @@ class MainActivity : AppCompatActivity() {
         vuBudget.meterType = LedVuMeterView.MeterType.DAILY_BUDGET
         vuGrace.meterType = LedVuMeterView.MeterType.GRACE_BUFFER
 
-        vaultManager = VaultManager(HavenDatabase.getInstance(this))
+        vaultManager = VaultManager(HavenDatabase.getDatabase(this))
 
         btnArm.setOnClickListener { 
             Toast.makeText(this, "Checking BLE & Permissions...", Toast.LENGTH_SHORT).show()
@@ -106,14 +106,20 @@ class MainActivity : AppCompatActivity() {
             lifecycleScope.launch(Dispatchers.IO) {
                 val file = vaultManager.exportVault(this@MainActivity)
                 withContext(Dispatchers.Main) {
-                    val msg = if (file != null) "Vault Exported: " + file.name else "Export Failed"
+                    val msg = if (file != null) "Vault Exported to Downloads!" else "Export Failed"
                     Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show()
                 }
             }
         }
 
         btnRestore.setOnClickListener {
-            Toast.makeText(this, "Place JSON file in Downloads to Restore", Toast.LENGTH_SHORT).show()
+            lifecycleScope.launch(Dispatchers.IO) {
+                val count = vaultManager.restoreVault(this@MainActivity)
+                withContext(Dispatchers.Main) {
+                    val msg = if (count >= 0) "Restored $count Excursions from Downloads" else "No Vault Backup Found"
+                    Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show()
+                }
+            }
         }
 
         renderTelemetry(0, 0, 0, 0, 1200, 75, 88, "COCKPIT_LIVE", "BLE: READY - TAP 'ARM' TO START")
