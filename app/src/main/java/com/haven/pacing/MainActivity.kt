@@ -72,12 +72,17 @@ class MainActivity : AppCompatActivity() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == HavenPacingService.ACTION_HUD_UPDATE) {
                 val servicePeak = intent.getIntExtra(HavenPacingService.EXTRA_PEAK_HR, 0)
+                val dailyPoints = intent.getDoubleExtra(HavenPacingService.EXTRA_DAILY_POINTS, 0.0)
+                val budgetPoints = intent.getDoubleExtra(HavenPacingService.EXTRA_BUDGET_POINTS, 20.0)
+                val excPoints = intent.getDoubleExtra(HavenPacingService.EXTRA_EXCURSION_POINTS, 0.0)
+
                 renderTelemetry(
                     intent.getIntExtra(HavenPacingService.EXTRA_HR, 0),
                     intent.getIntExtra(HavenPacingService.EXTRA_EXCURSION_SEC, 0),
                     servicePeak,
-                    intent.getIntExtra(HavenPacingService.EXTRA_DAILY_TOTAL_SEC, 0),
-                    intent.getIntExtra(HavenPacingService.EXTRA_BUDGET_SEC, 1200),
+                    dailyPoints,
+                    budgetPoints,
+                    excPoints,
                     intent.getIntExtra(HavenPacingService.EXTRA_STABILITY_SCORE, 75),
                     intent.getIntExtra(HavenPacingService.EXTRA_ACTIVE_CEILING, 88),
                     intent.getStringExtra(HavenPacingService.EXTRA_MODE) ?: "COCKPIT_LIVE",
@@ -134,7 +139,7 @@ class MainActivity : AppCompatActivity() {
             restoreFileLauncher.launch(arrayOf("application/json", "*/*"))
         }
 
-        renderTelemetry(0, 0, 0, 0, 1200, 75, 88, "COCKPIT_LIVE", "BLE: READY - TAP 'ARM' TO START")
+        renderTelemetry(0, 0, 0, 0.0, 20.0, 0.0, 75, 88, "COCKPIT_LIVE", "BLE: READY - TAP 'ARM' TO START")
         checkPermissionsAndStartService()
     }
 
@@ -149,7 +154,7 @@ class MainActivity : AppCompatActivity() {
 
         HavenPacingService.onTelemetryUpdate = { hr, excSec, totalSec, mode ->
             runOnUiThread {
-                renderTelemetry(hr, excSec, 0, totalSec, 1200, 75, 88, mode, "")
+                renderTelemetry(hr, excSec, 0, totalSec / 60.0, 20.0, 0.0, 75, 88, mode, "")
             }
         }
 
@@ -174,8 +179,9 @@ class MainActivity : AppCompatActivity() {
         hr: Int,
         excSec: Int,
         servicePeakHr: Int,
-        totalSec: Int,
-        budgetSec: Int,
+        dailyPoints: Double,
+        budgetPoints: Double,
+        excPoints: Double,
         stability: Int,
         ceiling: Int,
         mode: String,
@@ -266,24 +272,25 @@ class MainActivity : AppCompatActivity() {
             tvBufferStatus.setTextColor(Color.parseColor("#636366"))
         }
 
-        // 4. Budget Burn & Remaining Time
-        val budgetMin = budgetSec / 60
-        tvBudgetLabel.text = "DAILY BUDGET (" + budgetMin + "m CAP)"
-        vuBudget.setLevel(totalSec.toFloat(), budgetSec.toFloat())
+        // 4. Weighted PacePoint Budget Burn & Remaining Points
+        tvBudgetLabel.text = String.format("PACE POINTS (%.0f CAP)", budgetPoints)
+        vuBudget.setLevel(dailyPoints.toFloat(), budgetPoints.toFloat())
 
-        val remainingSec = budgetSec - totalSec
-        if (remainingSec >= 0) {
-            val rM = remainingSec / 60
-            val rS = remainingSec % 60
-            tvBudgetRemaining.text = String.format("%02d:%02d", rM, rS)
+        val remainingPoints = budgetPoints - dailyPoints
+        if (remainingPoints >= 0) {
+            tvBudgetRemaining.text = String.format("%.1f PTS", remainingPoints)
             tvBudgetRemaining.setTextColor(Color.parseColor("#00E676"))
-            tvPaceStatus.text = "PACE: ON TRACK"
-            tvPaceStatus.setTextColor(Color.parseColor("#00E676"))
+
+            if (dailyPoints >= budgetPoints * 0.75) {
+                tvPaceStatus.text = "PACE: GUARDED"
+                tvPaceStatus.setTextColor(Color.parseColor("#FF9100"))
+            } else {
+                tvPaceStatus.text = "PACE: ON TRACK"
+                tvPaceStatus.setTextColor(Color.parseColor("#00E676"))
+            }
         } else {
-            val debtSec = -remainingSec
-            val dM = debtSec / 60
-            val dS = debtSec % 60
-            tvBudgetRemaining.text = String.format("-%02d:%02d", dM, dS)
+            val debtPoints = -remainingPoints
+            tvBudgetRemaining.text = String.format("-%.1f PTS", debtPoints)
             tvBudgetRemaining.setTextColor(Color.parseColor("#FF5252"))
             tvPaceStatus.text = "PACE: OVER BUDGET"
             tvPaceStatus.setTextColor(Color.parseColor("#FF5252"))
@@ -297,7 +304,7 @@ class MainActivity : AppCompatActivity() {
             stability >= 30 -> "[VULNERABLE]"
             else            -> "[VETO / CRASH]"
         }
-        tvStabilityBanner.text = "STABILITY: " + stability + "/100 " + stabilityTier + " | CEIL: " + ceiling + " | BUD: " + budgetMin + "m"
+        tvStabilityBanner.text = String.format("STABILITY: %d/100 %s | CEIL: %d | BUD: %.0f PTS", stability, stabilityTier, ceiling, budgetPoints)
         val bannerColor = when {
             stability >= 70 -> Color.parseColor("#00E676")
             stability >= 50 -> Color.parseColor("#FFEA00")
