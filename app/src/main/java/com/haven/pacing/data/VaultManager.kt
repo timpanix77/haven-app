@@ -1,7 +1,11 @@
 package com.haven.pacing.data
 
+import android.content.ContentValues
 import android.content.Context
+import android.net.Uri
+import android.os.Build
 import android.os.Environment
+import android.provider.MediaStore
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
@@ -13,7 +17,7 @@ import java.util.Locale
 
 class VaultManager(private val database: HavenDatabase) {
 
-    suspend fun exportVault(context: Context): File? = withContext(Dispatchers.IO) {
+    suspend fun exportVault(context: Context): Boolean = withContext(Dispatchers.IO) {
         try {
             val records = database.havenDao().getExcursionsSince(0)
             val jsonArray = JSONArray()
@@ -37,14 +41,34 @@ class VaultManager(private val database: HavenDatabase) {
                 put("excursions", jsonArray)
             }
 
-            val downloadDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
             val timeStamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-            val outFile = File(downloadDir, "haven_vault_$timeStamp.json")
-            outFile.writeText(rootObj.toString(2))
-            outFile
+            val fileName = "haven_vault_$timeStamp.json"
+            val content = rootObj.toString(2)
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val values = ContentValues().apply {
+                    put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                    put(MediaStore.MediaColumns.MIME_TYPE, "application/json")
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_DOWNLOADS)
+                }
+                val uri: Uri? = context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                if (uri != null) {
+                    context.contentResolver.openOutputStream(uri)?.use { os ->
+                        os.write(content.toByteArray(Charsets.UTF_8))
+                    }
+                    true
+                } else {
+                    false
+                }
+            } else {
+                val downloadDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+                val outFile = File(downloadDir, fileName)
+                outFile.writeText(content)
+                true
+            }
         } catch (e: Exception) {
             e.printStackTrace()
-            null
+            false
         }
     }
 
