@@ -57,7 +57,8 @@ class MainActivity : AppCompatActivity() {
                     intent.getIntExtra(HavenPacingService.EXTRA_BUDGET_SEC, 1200),
                     intent.getIntExtra(HavenPacingService.EXTRA_STABILITY_SCORE, 75),
                     intent.getIntExtra(HavenPacingService.EXTRA_ACTIVE_CEILING, 88),
-                    intent.getStringExtra(HavenPacingService.EXTRA_MODE) ?: "COCKPIT_LIVE"
+                    intent.getStringExtra(HavenPacingService.EXTRA_MODE) ?: "COCKPIT_LIVE",
+                    intent.getStringExtra(HavenPacingService.EXTRA_BLE_STATUS) ?: ""
                 )
             }
         }
@@ -121,7 +122,7 @@ class MainActivity : AppCompatActivity() {
 
         HavenPacingService.onTelemetryUpdate = { hr, excSec, totalSec, mode ->
             runOnUiThread {
-                renderTelemetry(hr, excSec, 0, totalSec, 1200, 75, 88, mode)
+                renderTelemetry(hr, excSec, 0, totalSec, 1200, 75, 88, mode, "")
             }
         }
 
@@ -147,7 +148,8 @@ class MainActivity : AppCompatActivity() {
         budgetSec: Int,
         stability: Int,
         ceiling: Int,
-        mode: String
+        mode: String,
+        bleStatus: String = ""
     ) {
         // 1. Live BPM and VU Proximity
         if (hr > 0) {
@@ -174,6 +176,7 @@ class MainActivity : AppCompatActivity() {
         } else {
             tvLiveHr.text = "--"
             tvLiveHr.setTextColor(Color.parseColor("#8E8E93"))
+            tvHrStatus.text = if (bleStatus.isNotEmpty()) bleStatus else "BLE: SEARCHING..."
         }
 
         // 2. Peak Hold Readout
