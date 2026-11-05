@@ -1,5 +1,6 @@
 package com.haven.pacing.service
 
+import android.annotation.SuppressLint
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -13,12 +14,17 @@ import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
+import android.bluetooth.le.ScanCallback
+import android.bluetooth.le.ScanFilter
+import android.bluetooth.le.ScanResult
+import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.Intent
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.ParcelUuid
 import androidx.core.app.NotificationCompat
 import com.haven.pacing.MainActivity
 import com.haven.pacing.audio.HavenAudioEngine
@@ -35,6 +41,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.UUID
 
+@SuppressLint("MissingPermission")
 class HavenPacingService : Service() {
 
     companion object {
@@ -51,12 +58,12 @@ class HavenPacingService : Service() {
         const val EXTRA_STABILITY_SCORE = "extra_stability_score"
         const val EXTRA_ACTIVE_CEILING = "extra_active_ceiling"
         const val EXTRA_RECOVERY_FLOOR = "extra_recovery_floor"
+        const val EXTRA_BLE_STATUS = "extra_ble_status"
 
         val HEART_RATE_SERVICE_UUID: UUID = UUID.fromString("0000180d-0000-1000-8000-00805f9b34fb")
         val HEART_RATE_MEASUREMENT_CHAR_UUID: UUID = UUID.fromString("00002a37-0000-1000-8000-00805f9b34fb")
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
-        // Direct subscribers for MainActivity
         var isServiceRunning: Boolean = false
         var onTelemetryUpdate: ((hr: Int, excursionSec: Int, debtSec: Int, mode: String) -> Unit)? = null
     }
@@ -70,14 +77,15 @@ class HavenPacingService : Service() {
 
     private var bluetoothAdapter: BluetoothAdapter? = null
     private var bluetoothGatt: BluetoothGatt? = null
+    private var bleStatusMessage: String = "BLE: INITIALIZING..."
+    private var isScanning: Boolean = false
 
     private val tickerHandler = Handler(Looper.getMainLooper())
     private val tickerRunnable = object : Runnable {
         override fun run() {
             stateMachine.onTick()
             broadcastHudUpdate()
-            
-            // Dispatch direct 1Hz telemetry update to MainActivity
+
             onTelemetryUpdate?.invoke(
                 stateMachine.currentHr,
                 stateMachine.excursionSeconds,
@@ -133,7 +141,6 @@ class HavenPacingService : Service() {
                 broadcastHudUpdate()
             }
             is TelemetryEvent.Settled -> {
-                // 1. Silent Vault Persistence: Log every excursion to SQLite
                 serviceScope.launch(Dispatchers.IO) {
                     val record = ExcursionRecord(
                         timestamp = System.currentTimeMillis(),
@@ -145,7 +152,6 @@ class HavenPacingService : Service() {
                     vaultDatabase.havenDao().insert(record)
                 }
 
-                // 2. Settlement Voice: Speak ONLY if the 2-minute buffer was breached
                 if (event.voiceAlerted) {
                     audioEngine.speak("Settled at ${event.hr}. Excursion ${event.excursionSec} seconds.")
                 }
@@ -177,7 +183,6 @@ class HavenPacingService : Service() {
                 totalWeightedStrain += (rec.strainPoints * weight)
             }
 
-            // Calculate 0-100 Autonomic Stability Index
             val calculatedScore = (100 - (totalWeightedStrain * 0.05).toInt()).coerceIn(10, 100)
 
             val (targetCeiling, targetBudgetMin) = when {
@@ -199,27 +204,129 @@ class HavenPacingService : Service() {
     }
 
     private fun connectGarminBle() {
+        val adapter = bluetoothAdapter
+        if (adapter == null || !adapter.isEnabled) {
+            bleStatusMessage = "BLE: BLUETOOTH OFF"
+            broadcastHudUpdate()
+            return
+        }
+
+        try {
+            val pairedDevices = adapter.bondedDevices ?: emptySet()
+            val targetDevice = pairedDevices.firstOrNull { device ->
+                val name = device.name ?: ""
+                name.contains("Venu", ignoreCase = true) ||
+                name.contains("Garmin", ignoreCase = true) ||
+                name.contains("Watch", ignoreCase = true) ||
+                name.contains("Forerunner", ignoreCase = true) ||
+                name.contains("Fenix", ignoreCase = true)
+            } ?: if (pairedDevices.size == 1) pairedDevices.first() else null
+
+            if (targetDevice != null) {
+                val devName = targetDevice.name ?: "Garmin Device"
+                bleStatusMessage = "BLE: CONNECTING TO " + devName + "..."
+                broadcastHudUpdate()
+
+                bluetoothGatt?.close()
+                bluetoothGatt = targetDevice.connectGatt(
+                    this,
+                    false, // Direct connection (no autoConnect stall)
+                    gattCallback,
+                    BluetoothDevice.TRANSPORT_LE // Force BLE transport
+                )
+            } else {
+                startBleHeartRateScan()
+            }
+        } catch (e: SecurityException) {
+            bleStatusMessage = "BLE: PERMISSION MISSING"
+            broadcastHudUpdate()
+        }
+    }
+
+    private fun startBleHeartRateScan() {
         val adapter = bluetoothAdapter ?: return
-        if (!adapter.isEnabled) return
+        val scanner = adapter.bluetoothLeScanner
+        if (scanner == null) {
+            bleStatusMessage = "BLE: SCANNER NOT AVAILABLE"
+            broadcastHudUpdate()
+            return
+        }
 
-        val pairedDevices: Set<BluetoothDevice> = adapter.bondedDevices
-        val venuDevice = pairedDevices.firstOrNull { 
-            it.name?.contains("Venu", ignoreCase = true) == true || 
-            it.name?.contains("Garmin", ignoreCase = true) == true 
-        } ?: return
+        if (isScanning) return
+        isScanning = true
+        bleStatusMessage = "BLE: SCANNING FOR HR BROADCAST..."
+        broadcastHudUpdate()
 
-        bluetoothGatt = venuDevice.connectGatt(this, true, gattCallback)
+        try {
+            val filter = ScanFilter.Builder()
+                .setServiceUuid(ParcelUuid(HEART_RATE_SERVICE_UUID))
+                .build()
+            val settings = ScanSettings.Builder()
+                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                .build()
+
+            scanner.startScan(listOf(filter), settings, scanCallback)
+
+            tickerHandler.postDelayed({
+                if (isScanning && stateMachine.currentHr <= 0) {
+                    stopBleScan()
+                    bleStatusMessage = "BLE: NO HR DETECTED (CHECK BROADCAST)"
+                    broadcastHudUpdate()
+                }
+            }, 30_000)
+        } catch (e: SecurityException) {
+            isScanning = false
+            bleStatusMessage = "BLE: SCAN PERMISSION MISSING"
+            broadcastHudUpdate()
+        }
+    }
+
+    private fun stopBleScan() {
+        if (!isScanning) return
+        isScanning = false
+        try {
+            bluetoothAdapter?.bluetoothLeScanner?.stopScan(scanCallback)
+        } catch (e: SecurityException) {}
+    }
+
+    private val scanCallback = object : ScanCallback() {
+        override fun onScanResult(callbackType: Int, result: ScanResult?) {
+            val device = result?.device ?: return
+            stopBleScan()
+            val devName = try { device.name ?: "Detected Device" } catch (e: SecurityException) { "Device" }
+            bleStatusMessage = "BLE: CONNECTING TO " + devName + "..."
+            broadcastHudUpdate()
+
+            bluetoothGatt?.close()
+            bluetoothGatt = device.connectGatt(
+                this@HavenPacingService,
+                false,
+                gattCallback,
+                BluetoothDevice.TRANSPORT_LE
+            )
+        }
+
+        override fun onScanFailed(errorCode: Int) {
+            isScanning = false
+            bleStatusMessage = "BLE: SCAN FAILED (CODE $errorCode)"
+            broadcastHudUpdate()
+        }
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
+                bleStatusMessage = "BLE: CONNECTED - DISCOVERING..."
+                broadcastHudUpdate()
                 refreshGattCache(gatt)
                 gatt.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
+                bleStatusMessage = "BLE: DISCONNECTED (RETRIEVING...)"
+                broadcastHudUpdate()
+                stateMachine.updateHeartRate(0)
                 gatt.close()
                 bluetoothGatt = null
-                tickerHandler.postDelayed({ connectGarminBle() }, 5000)
+                tickerHandler.postDelayed({ connectGarminBle() }, 3000)
             }
         }
 
@@ -233,8 +340,16 @@ class HavenPacingService : Service() {
                     if (descriptor != null) {
                         descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
                         gatt.writeDescriptor(descriptor)
+                        bleStatusMessage = "BLE: HR STREAM ARMED"
+                        broadcastHudUpdate()
                     }
+                } else {
+                    bleStatusMessage = "BLE: HR SERVICE NOT FOUND (START BROADCAST)"
+                    broadcastHudUpdate()
                 }
+            } else {
+                bleStatusMessage = "BLE: SERVICE DISCOVERY FAILED"
+                broadcastHudUpdate()
             }
         }
 
@@ -256,7 +371,7 @@ class HavenPacingService : Service() {
         try {
             val refreshMethod = gatt.javaClass.getMethod("refresh")
             refreshMethod.invoke(gatt)
-        } catch (_: Exception) {}
+        } catch (e: Exception) {}
     }
 
     private fun broadcastHudUpdate() {
@@ -270,6 +385,7 @@ class HavenPacingService : Service() {
             putExtra(EXTRA_STABILITY_SCORE, stateMachine.stabilityScore)
             putExtra(EXTRA_ACTIVE_CEILING, stateMachine.activeCeiling)
             putExtra(EXTRA_RECOVERY_FLOOR, stateMachine.recoveryFloor)
+            putExtra(EXTRA_BLE_STATUS, bleStatusMessage)
         }
         sendBroadcast(intent)
     }
@@ -317,6 +433,7 @@ class HavenPacingService : Service() {
         super.onDestroy()
         isServiceRunning = false
         onTelemetryUpdate = null
+        stopBleScan()
         tickerHandler.removeCallbacks(tickerRunnable)
         serviceJob.cancel()
         bluetoothGatt?.close()
