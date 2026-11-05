@@ -18,8 +18,10 @@ import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanFilter
 import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.os.Build
 import android.os.Handler
 import android.os.IBinder
@@ -66,6 +68,12 @@ class HavenPacingService : Service() {
 
         var isServiceRunning: Boolean = false
         var onTelemetryUpdate: ((hr: Int, excursionSec: Int, debtSec: Int, mode: String) -> Unit)? = null
+
+        private var instance: HavenPacingService? = null
+
+        fun checkPendingMorningBrief() {
+            instance?.deliverPendingBrief()
+        }
     }
 
     private val serviceJob = SupervisorJob()
@@ -79,6 +87,15 @@ class HavenPacingService : Service() {
     private var bluetoothGatt: BluetoothGatt? = null
     private var bleStatusMessage: String = "BLE: INITIALIZING..."
     private var isScanning: Boolean = false
+    private var pendingMorningBrief: String? = null
+
+    private val userUnlockReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == Intent.ACTION_USER_PRESENT) {
+                deliverPendingBrief()
+            }
+        }
+    }
 
     private val tickerHandler = Handler(Looper.getMainLooper())
     private val tickerRunnable = object : Runnable {
@@ -100,6 +117,7 @@ class HavenPacingService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        instance = this
         isServiceRunning = true
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification("Starting telemetry..."))
@@ -118,9 +136,13 @@ class HavenPacingService : Service() {
         val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         bluetoothAdapter = bluetoothManager.adapter
 
+        // Register unlock detector to gate morning voice brief
+        val unlockFilter = IntentFilter(Intent.ACTION_USER_PRESENT)
+        registerReceiver(userUnlockReceiver, unlockFilter)
+
         tickerHandler.post(tickerRunnable)
         connectGarminBle()
-        evaluateMorningStability()
+        evaluateMorningStability(isBoot = true)
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -128,6 +150,12 @@ class HavenPacingService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun deliverPendingBrief() {
+        val brief = pendingMorningBrief ?: return
+        pendingMorningBrief = null
+        audioEngine.speak(brief)
+    }
 
     private fun handleTelemetryEvent(event: TelemetryEvent) {
         when (event) {
@@ -161,12 +189,13 @@ class HavenPacingService : Service() {
                 broadcastHudUpdate()
             }
             is TelemetryEvent.DayRollover -> {
-                evaluateMorningStability()
+                // 0400 rollover: evaluate silently, latch brief for morning unlock
+                evaluateMorningStability(isBoot = false)
             }
         }
     }
 
-    private fun evaluateMorningStability() {
+    private fun evaluateMorningStability(isBoot: Boolean) {
         serviceScope.launch(Dispatchers.IO) {
             val now = System.currentTimeMillis()
             val threeDaysAgo = now - (72 * 3600 * 1000)
@@ -196,7 +225,14 @@ class HavenPacingService : Service() {
             stateMachine.applyDynamicCalibration(calculatedScore, targetCeiling, targetBudgetMin)
 
             withContext(Dispatchers.Main) {
-                audioEngine.speak("Stability $calculatedScore of 100. Ceiling $targetCeiling. Budget $targetBudgetMin minutes.")
+                val briefText = "Stability $calculatedScore of 100. Ceiling $targetCeiling. Budget $targetBudgetMin minutes."
+                if (isBoot) {
+                    // On initial manual app launch, speak immediately
+                    audioEngine.speak(briefText)
+                } else {
+                    // At 0400 silent rollover, latch until user unlocks phone
+                    pendingMorningBrief = briefText
+                }
                 broadcastHudUpdate()
                 updateForegroundNotification()
             }
@@ -262,7 +298,6 @@ class HavenPacingService : Service() {
                 .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
                 .build()
 
-            // Open scan to ensure all Garmin advertising packets are captured
             scanner.startScan(null, settings, scanCallback)
 
             tickerHandler.postDelayed({
@@ -435,11 +470,15 @@ class HavenPacingService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        instance = null
         isServiceRunning = false
         onTelemetryUpdate = null
         stopBleScan()
         tickerHandler.removeCallbacks(tickerRunnable)
         serviceJob.cancel()
+        try {
+            unregisterReceiver(userUnlockReceiver)
+        } catch (e: Exception) {}
         bluetoothGatt?.close()
         bluetoothGatt = null
         audioEngine.shutdown()
