@@ -82,6 +82,8 @@ jobs:
 
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: "8.7"
 
       - name: Build APK
         run: |
@@ -89,14 +91,7 @@ jobs:
             chmod +x ./gradlew
             ./gradlew assembleDebug
           else
-            GRADLEW_PATH=$(find . -name gradlew -type f | head -n 1)
-            if [ -n "$GRADLEW_PATH" ]; then
-              chmod +x "$GRADLEW_PATH"
-              cd "$(dirname "$GRADLEW_PATH")"
-              ./gradlew assembleDebug
-            else
-              gradle assembleDebug
-            fi
+            gradle assembleDebug
           fi
 
       - name: Upload APK
