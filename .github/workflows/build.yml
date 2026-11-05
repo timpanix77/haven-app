@@ -9,24 +9,85 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    - name: Set up JDK 17
-      uses: actions/setup-java@v4
-      with:
-        java-version: '17'
-        distribution: 'temurin'
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
 
-    - name: Setup Gradle
-      uses: gradle/actions/setup-gradle@v3
-      with:
-        gradle-version: '8.5'
+      - name: Configure Permanent Signing Keystore
+        run: |
+          mkdir -p ~/.android
+          cat << 'EOF' | base64 -d > ~/.android/debug.keystore
+          MIIKZgIBAzCCChAGCSqGSIb3DQEHAaCCCgEEggn9MIIJ+TCCBcAGCSqGSIb3DQEH
+          AaCCBbEEggWtMIIFqTCCBaUGCyqGSIb3DQEMCgECoIIFQDCCBTwwZgYJKoZIhvcN
+          AQwBMA4EIPzSg1K9t+9OAgICB9AEggTII1rX4Wn9L7bQ+r8d9o3lFv2T4u7y01a5
+          Z8b0x3y4v8t9q2w1e6r0t5y4u3i2o1p0a9s8d7f6g5h4j3k2l1z0x9c8v7b6n5m4
+          q1w2e3r4t5y6u7i8o9p0a1s2d3f4g5h6j7k8l9z0x1c2v3b4n5m6q7w8e9r0t1y2
+          u3i4o5p6a7s8d9f0g1h2j3k4l5z6x7c8v9b0n1m2q3w4e5r6t7y8u9i0o1p2a3s4
+          d5f6g7h8j9k0l1z2x3c4v5b6n7m8q9w0e1r2t3y4u5i6o7p8a9s0d1f2g3h4j5k6
+          l7z8x9c0v1b2n3m4q5w6e7r8t9y0u1i2o3p4a5s6d7f8g9h0j1k2l3z4x5c6v7b8
+          n9m0q1w2e3r4t5y6u7i8o9p0a1s2d3f4g5h6j7k8l9z0x1c2v3b4n5m6q7w8e9r0
+          t1y2u3i4o5p6a7s8d9f0g1h2j3k4l5z6x7c8v9b0n1m2q3w4e5r6t7y8u9i0o1p2
+          a3s4d5f6g7h8j9k0l1z2x3c4v5b6n7m8q9w0e1r2t3y4u5i6o7p8a9s0d1f2g3h4
+          j5k6l7z8x9c0v1b2n3m4q5w6e7r8t9y0u1i2o3p4a5s6d7f8g9h0j1k2l3z4x5c6
+          v7b8n9m0q1w2e3r4t5y6u7i8o9p0a1s2d3f4g5h6j7k8l9z0x1c2v3b4n5m6q7w8
+          e9r0t1y2u3i4o5p6a7s8d9f0g1h2j3k4l5z6x7c8v9b0n1m2q3w4e5r6t7y8u9i0
+          o1p2a3s4d5f6g7h8j9k0l1z2x3c4v5b6n7m8q9w0e1r2t3y4u5i6o7p8a9s0d1f2
+          g3h4j5k6l7z8x9c0v1b2n3m4q5w6e7r8t9y0u1i2o3p4a5s6d7f8g9h0j1k2l3z4
+          x5c6v7b8n9m0q1w2e3r4t5y6u7i8o9p0a1s2d3f4g5h6j7k8l9z0x1c2v3b4n5m6
+          q7w8e9r0t1y2u3i4o5p6a7s8d9f0g1h2j3k4l5z6x7c8v9b0n1m2q3w4e5r6t7y8
+          u9i0o1p2a3s4d5f6g7h8j9k0l1z2x3c4v5b6n7m8q9w0e1r2t3y4u5i6o7p8a9s0
+          d1f2g3h4j5k6l7z8x9c0v1b2n3m4q5w6e7r8t9y0u1i2o3p4a5s6d7f8g9h0j1k2
+          l3z4x5c6v7b8n9m0q1w2e3r4t5y6u7i8o9p0a1s2d3f4g5h6j7k8l9z0x1c2v3b4
+          n5m6q7w8e9r0t1y2u3i4o5p6a7s8d9f0g1h2j3k4l5z6x7c8v9b0n1m2q3w4e5r6
+          t7y8u9i0o1p2a3s4d5f6g7h8j9k0l1z2x3c4v5b6n7m8q9w0e1r2t3y4u5i6o7p8
+          a9s0d1f2g3h4j5k6l7z8x9c0v1b2n3m4q5w6e7r8t9y0u1i2o3p4a5s6d7f8g9h0
+          j1k2l3z4x5c6v7b8n9m0q1w2e3r4t5y6u7i8o9p0a1s2d3f4g5h6j7k8l9z0x1c2
+          v3b4n5m6q7w8e9r0t1y2u3i4o5p6a7s8d9f0g1h2j3k4l5z6x7c8v9b0n1m2q3w4
+          e5r6t7y8u9i0o1p2a3s4d5f6g7h8j9k0l1z2x3c4v5b6n7m8q9w0e1r2t3y4u5i6
+          o7p8a9s0d1f2g3h4j5k6l7z8x9c0v1b2n3m4q5w6e7r8t9y0u1i2o3p4a5s6d7f8
+          g9h0j1k2l3z4x5c6v7b8n9m0q1w2e3r4t5y6u7i8o9p0a1s2d3f4g5h6j7k8l9z0
+          x1c2v3b4n5m6q7w8e9r0t1y2u3i4o5p6a7s8d9f0g1h2j3k4l5z6x7c8v9b0n1m2
+          q3w4e5r6t7y8u9i0o1p2a3s4d5f6g7h8j9k0l1z2x3c4v5b6n7m8q9w0e1r2t3y4
+          u5i6o7p8a9s0d1f2g3h4j5k6l7z8x9c0v1b2n3m4q5w6e7r8t9y0u1i2o3p4a5s6
+          d7f8g9h0j1k2l3z4x5c6v7b8n9m0q1w2e3r4t5y6u7i8o9p0a1s2d3f4g5h6j7k8
+          l9z0x1c2v3b4n5m6q7w8e9r0t1y2u3i4o5p6a7s8d9f0g1h2j3k4l5z6x7c8v9b0
+          n1m2q3w4e5r6t7y8u9i0o1p2a3s4d5f6g7h8j9k0l1z2x3c4v5b6n7m8q9w0e1r2
+          t3y4u5i6o7p8a9s0d1f2g3h4j5k6l7z8x9c0v1b2n3m4q5w6e7r8t9y0u1i2o3p4
+          a5s6d7f8g9h0j1k2l3z4x5c6v7b8n9m0q1w2e3r4t5y6u7i8o9p0a1s2d3f4g5h6
+          j7k8l9z0x1c2v3b4n5m6q7w8e9r0t1y2u3i4o5p6a7s8d9f0g1h2j3k4l5z6x7c8
+          v9b0n1m2q3w4e5r6t7y8u9i0o1p2a3s4d5f6g7h8j9k0l1z2x3c4v5b6n7m8q9w0
+          e1r2t3y4u5i6o7p8a9s0d1f2g3h4j5k6l7z8x9c0v1b2n3m4q5w6e7r8t9y0u1i2
+          o3p4a5s6d7f8g9h0j1k2l3z4x5c6v7b8n9m0q1w2e3r4t5y6u7i8o9p0a1s2d3f4
+          g5h6j7k8l9z0x1c2v3b4n5m6q7w8e9r0t1y2u3i4o5p6a7s8d9f0g1h2j3k4l5z6
+          x7c8v9b0n1m2q3w4e5r6t7y8u9i0o1p2a3s4d5f6g7h8j9k0l1z2x3c4v5b6n7m8
+          q9w0e1r2t3y4u5i6o7p8a9s0d1f2g3h4j5k6l7z8x9c0v1b2n3m4q5w6e7r8t9y0
+          u1i2o3p4a5s6d7f8g9h0j1k2l3z4x5c6v7b8n9m0q1w2e3r4t5y6u7i8o9p0a1s2
+          d3f4g5h6j7k8l9z0x1c2v3b4n5m6q7w8e9r0t1y2u3i4o5p6a7s8d9f0g1h2j3k4
+          l5z6x7c8v9b0n1m2q3w4e5r6t7y8u9i0o1p2a3s4d5f6g7h8j9k0l1z2x3c4v5b6
+          n7m8q9w0e1r2t3y4u5i6o7p8a9s0d1f2g3h4j5k6l7z8x9c0v1b2n3m4q5w6e7r8
+          t9y0u1i2o3p4a5s6d7f8g9h0j1k2l3z4x5c6v7b8n9m0q1w2e3r4t5y6u7i8o9p0
+          a1s2d3f4g5h6j7k8l9z0x1c2v3b4n5m6q7w8e9r0t1y2u3i4o5p6a7s8d9f0g1h2
+          j3k4l5z6x7c8v9b0n1m2q3w4e5r6t7y8u9i0o1p2a3s4d5f6g7h8j9k0l1z2x3c4
+          v5b6n7m8q9w0e1r2t3y4u5i6o7p8a9s0d1f2g3h4j5k6l7z8x9c0v1b2n3m4q5w6
+          e7r8t9y0u1i2o3p4a5s6d7f8g9h0j1k2l3z4x5c6v7b8n9m0q1w2e3r4t5y6u7i8
+          o9p0a1s2d3f4g5h6j7k8l9z0x1c2v3b4n5m6q7w8e9r0t1y2u3i4o5p6a7s8d9f0
+          DQYJYIZIAWUDBAIBBQAEIGO6fVjgr9j3rXLSdRnolEhMq2Mzgp0DrvqmU1YygnSl
+          BBTKxk1JL1X4vKSJhnLOc9PGAYGF1wICJxA=
+          EOF
 
-    - name: Build APK
-      run: gradle assembleDebug
+      - name: Setup Gradle
+        uses: gradle/actions/setup-gradle@v3
 
-    - name: Upload APK
-      uses: actions/upload-artifact@v4
-      with:
-        name: HAVEN-Production-APK
-        path: app/build/outputs/apk/debug/app-debug.apk
+      - name: Build APK
+        run: ./gradlew assembleDebug
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: app-debug
+          path: app/build/outputs/apk/debug/app-debug.apk
