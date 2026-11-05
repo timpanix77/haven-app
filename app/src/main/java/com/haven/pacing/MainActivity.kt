@@ -46,13 +46,18 @@ class MainActivity : AppCompatActivity() {
     private lateinit var vaultManager: VaultManager
     private var lastRecordedExcursionSec: Int = 0
 
+    // Indefinite Latched Peak Memory for POTS visual anchoring
+    private var latchedPeakHr: Int = 0
+    private var currentSurgePeakHr: Int = 0
+
     private val hudReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == HavenPacingService.ACTION_HUD_UPDATE) {
+                val servicePeak = intent.getIntExtra(HavenPacingService.EXTRA_PEAK_HR, 0)
                 renderTelemetry(
                     intent.getIntExtra(HavenPacingService.EXTRA_HR, 0),
                     intent.getIntExtra(HavenPacingService.EXTRA_EXCURSION_SEC, 0),
-                    intent.getIntExtra(HavenPacingService.EXTRA_PEAK_HR, 0),
+                    servicePeak,
                     intent.getIntExtra(HavenPacingService.EXTRA_DAILY_TOTAL_SEC, 0),
                     intent.getIntExtra(HavenPacingService.EXTRA_BUDGET_SEC, 1200),
                     intent.getIntExtra(HavenPacingService.EXTRA_STABILITY_SCORE, 75),
@@ -92,7 +97,10 @@ class MainActivity : AppCompatActivity() {
 
         vaultManager = VaultManager(HavenDatabase.getInstance(this))
 
-        btnArm.setOnClickListener { checkPermissionsAndStartService() }
+        btnArm.setOnClickListener { 
+            Toast.makeText(this, "Checking BLE & Permissions...", Toast.LENGTH_SHORT).show()
+            checkPermissionsAndStartService() 
+        }
 
         btnExport.setOnClickListener {
             lifecycleScope.launch(Dispatchers.IO) {
@@ -108,6 +116,7 @@ class MainActivity : AppCompatActivity() {
             Toast.makeText(this, "Place JSON file in Downloads to Restore", Toast.LENGTH_SHORT).show()
         }
 
+        renderTelemetry(0, 0, 0, 0, 1200, 75, 88, "COCKPIT_LIVE", "BLE: READY - TAP 'ARM' TO START")
         checkPermissionsAndStartService()
     }
 
@@ -129,6 +138,9 @@ class MainActivity : AppCompatActivity() {
         if (HavenPacingService.isServiceRunning) {
             btnArm.text = "ENGINE ACTIVE (ARMED)"
             btnArm.setTextColor(Color.parseColor("#00E676"))
+        } else {
+            btnArm.text = "START PACING ENGINE"
+            btnArm.setTextColor(Color.WHITE)
         }
     }
 
@@ -143,7 +155,7 @@ class MainActivity : AppCompatActivity() {
     private fun renderTelemetry(
         hr: Int,
         excSec: Int,
-        peakHr: Int,
+        servicePeakHr: Int,
         totalSec: Int,
         budgetSec: Int,
         stability: Int,
@@ -151,7 +163,7 @@ class MainActivity : AppCompatActivity() {
         mode: String,
         bleStatus: String = ""
     ) {
-        // 1. Live BPM and VU Proximity
+        // 1. Live BPM and Proximity Bar
         if (hr > 0) {
             tvLiveHr.text = hr.toString()
             vuHr.setLevel((hr - 40).coerceAtLeast(0).toFloat(), 70f)
@@ -169,7 +181,7 @@ class MainActivity : AppCompatActivity() {
                     tvHrStatus.text = "BPM / CEILING WARNING"
                 }
                 else -> {
-                    tvLiveHr.setTextColor(Color.parseColor("#FF1744"))
+                    tvLiveHr.setTextColor(Color.parseColor("#FF5252"))
                     tvHrStatus.text = "BPM / CEILING BREACH (" + ceiling + ")"
                 }
             }
@@ -179,9 +191,36 @@ class MainActivity : AppCompatActivity() {
             tvHrStatus.text = if (bleStatus.isNotEmpty()) bleStatus else "BLE: SEARCHING..."
         }
 
-        // 2. Peak Hold Readout
-        if (peakHr > 0) {
-            tvPeakIndicator.text = "PEAK: " + peakHr + " BPM"
+        // 2. Indefinite Peak Latching Logic for POTS Visual Reminders
+        if (excSec > 0) {
+            if (currentSurgePeakHr == 0 || hr > currentSurgePeakHr) {
+                currentSurgePeakHr = hr
+            }
+            latchedPeakHr = currentSurgePeakHr
+        } else {
+            currentSurgePeakHr = 0
+        }
+
+        if (servicePeakHr > latchedPeakHr) {
+            latchedPeakHr = servicePeakHr
+        }
+        if (hr >= ceiling && hr > latchedPeakHr) {
+            latchedPeakHr = hr
+        }
+
+        // Display latched peak indefinitely with Dark Blood Crimson at 115+ BPM
+        if (latchedPeakHr > 0) {
+            tvPeakIndicator.text = "PEAK: " + latchedPeakHr + " BPM"
+            val peakColor = when {
+                latchedPeakHr >= 115 -> Color.parseColor("#660000") // Dark Blood Crimson (Severe POTS Warning)
+                latchedPeakHr >= ceiling -> Color.parseColor("#FF5252") // Alert Red
+                latchedPeakHr >= 76 -> Color.parseColor("#FFEA00") // Warning Yellow
+                else -> Color.parseColor("#00E676") // Green
+            }
+            tvPeakIndicator.setTextColor(peakColor)
+        } else {
+            tvPeakIndicator.text = "PEAK: --"
+            tvPeakIndicator.setTextColor(Color.parseColor("#8E8E93"))
         }
 
         // 3. Excursion Stopwatch & Grace Buffer
@@ -225,9 +264,9 @@ class MainActivity : AppCompatActivity() {
             val dM = debtSec / 60
             val dS = debtSec % 60
             tvBudgetRemaining.text = String.format("-%02d:%02d", dM, dS)
-            tvBudgetRemaining.setTextColor(Color.parseColor("#FF1744"))
+            tvBudgetRemaining.setTextColor(Color.parseColor("#FF5252"))
             tvPaceStatus.text = "PACE: OVER BUDGET"
-            tvPaceStatus.setTextColor(Color.parseColor("#FF1744"))
+            tvPaceStatus.setTextColor(Color.parseColor("#FF5252"))
         }
 
         // 5. Morning Stability Panel (0-100)
@@ -239,14 +278,13 @@ class MainActivity : AppCompatActivity() {
             else            -> "[VETO / CRASH]"
         }
         tvStabilityBanner.text = "STABILITY: " + stability + "/100 " + stabilityTier + " | CEIL: " + ceiling + " | BUD: " + budgetMin + "m"
-        tvStabilityBanner.setTextColor(
-            when {
-                stability >= 70 -> Color.parseColor("#00E676")
-                stability >= 50 -> Color.parseColor("#FFEA00")
-                stability >= 30 -> Color.parseColor("#FF9100")
-                else            -> Color.parseColor("#FF1744")
-            }
-        )
+        val bannerColor = when {
+            stability >= 70 -> Color.parseColor("#00E676")
+            stability >= 50 -> Color.parseColor("#FFEA00")
+            stability >= 30 -> Color.parseColor("#FF9100")
+            else            -> Color.parseColor("#660000") // Dark Blood Crimson for unstable crash veto
+        }
+        tvStabilityBanner.setTextColor(bannerColor)
 
         // 6. Cockpit Mode
         if (mode == "COCKPIT_DARK") {
@@ -276,6 +314,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         if (missing.isNotEmpty()) {
+            Toast.makeText(this, "Requesting OS Permissions...", Toast.LENGTH_SHORT).show()
             ActivityCompat.requestPermissions(this, missing.toTypedArray(), 101)
         } else {
             startHavenService()
@@ -284,19 +323,27 @@ class MainActivity : AppCompatActivity() {
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
+        if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
+            Toast.makeText(this, "Permissions Granted!", Toast.LENGTH_SHORT).show()
             startHavenService()
+        } else {
+            Toast.makeText(this, "Permission Denied in OS! Enable in App Settings", Toast.LENGTH_LONG).show()
         }
     }
 
     private fun startHavenService() {
         val serviceIntent = Intent(this, HavenPacingService::class.java)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(serviceIntent)
-        } else {
-            startService(serviceIntent)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(serviceIntent)
+            } else {
+                startService(serviceIntent)
+            }
+            btnArm.text = "ENGINE ACTIVE (ARMED)"
+            btnArm.setTextColor(Color.parseColor("#00E676"))
+            Toast.makeText(this, "Haven Engine Starting...", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "Service Start Error: " + e.message, Toast.LENGTH_LONG).show()
         }
-        btnArm.text = "ENGINE ACTIVE (ARMED)"
-        btnArm.setTextColor(Color.parseColor("#00E676"))
     }
 }
