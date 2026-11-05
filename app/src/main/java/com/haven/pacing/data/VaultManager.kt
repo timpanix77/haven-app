@@ -10,7 +10,9 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.BufferedReader
 import java.io.File
+import java.io.InputStreamReader
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -72,15 +74,20 @@ class VaultManager(private val database: HavenDatabase) {
         }
     }
 
-    suspend fun restoreVault(context: Context): Int = withContext(Dispatchers.IO) {
+    suspend fun restoreVaultFromUri(context: Context, uri: Uri): Int = withContext(Dispatchers.IO) {
         try {
-            val downloadDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-            val files = downloadDir.listFiles { file ->
-                file.name.startsWith("haven_vault_") && file.name.endsWith(".json")
+            val stringBuilder = StringBuilder()
+            context.contentResolver.openInputStream(uri)?.use { inputStream ->
+                BufferedReader(InputStreamReader(inputStream, Charsets.UTF_8)).use { reader ->
+                    var line: String? = reader.readLine()
+                    while (line != null) {
+                        stringBuilder.append(line)
+                        line = reader.readLine()
+                    }
+                }
             } ?: return@withContext -1
 
-            val latestFile = files.maxByOrNull { it.lastModified() } ?: return@withContext -1
-            val content = latestFile.readText()
+            val content = stringBuilder.toString()
             val rootObj = JSONObject(content)
             val excursions = rootObj.getJSONArray("excursions")
 
