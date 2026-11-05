@@ -342,4 +342,16 @@ class MainActivity : AppCompatActivity() {
     private fun startHavenService() {
         val serviceIntent = Intent(this, HavenPacingService::class.java)
         try {
-            if (Build.VERSION.SDK_
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(serviceIntent)
+            } else {
+                startService(serviceIntent)
+            }
+            btnArm.text = "ENGINE ACTIVE (ARMED)"
+            btnArm.setTextColor(Color.parseColor("#00E676"))
+            Toast.makeText(this, "Haven Engine Starting...", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "Service Start Error: " + e.message, Toast.LENGTH_LONG).show()
+        }
+    }
+}
