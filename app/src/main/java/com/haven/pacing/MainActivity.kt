@@ -7,11 +7,13 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
@@ -49,6 +51,22 @@ class MainActivity : AppCompatActivity() {
     // Indefinite Latched Peak Memory for POTS visual anchoring
     private var latchedPeakHr: Int = 0
     private var currentSurgePeakHr: Int = 0
+
+    private val restoreFileLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            lifecycleScope.launch(Dispatchers.IO) {
+                val count = vaultManager.restoreVaultFromUri(this@MainActivity, uri)
+                withContext(Dispatchers.Main) {
+                    val msg = if (count >= 0) "Restored $count Excursions!" else "Restore Failed"
+                    Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show()
+                }
+            }
+        } else {
+            Toast.makeText(this, "Restore Cancelled", Toast.LENGTH_SHORT).show()
+        }
+    }
 
     private val hudReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -113,13 +131,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         btnRestore.setOnClickListener {
-            lifecycleScope.launch(Dispatchers.IO) {
-                val count = vaultManager.restoreVault(this@MainActivity)
-                withContext(Dispatchers.Main) {
-                    val msg = if (count >= 0) "Restored $count Excursions from Downloads" else "No Vault Backup Found"
-                    Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show()
-                }
-            }
+            restoreFileLauncher.launch(arrayOf("application/json", "*/*"))
         }
 
         renderTelemetry(0, 0, 0, 0, 1200, 75, 88, "COCKPIT_LIVE", "BLE: READY - TAP 'ARM' TO START")
