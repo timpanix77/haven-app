@@ -230,9 +230,9 @@ class HavenPacingService : Service() {
                 bluetoothGatt?.close()
                 bluetoothGatt = targetDevice.connectGatt(
                     this,
-                    false, // Direct connection (no autoConnect stall)
+                    false,
                     gattCallback,
-                    BluetoothDevice.TRANSPORT_LE // Force BLE transport
+                    BluetoothDevice.TRANSPORT_LE
                 )
             } else {
                 startBleHeartRateScan()
@@ -258,14 +258,12 @@ class HavenPacingService : Service() {
         broadcastHudUpdate()
 
         try {
-            val filter = ScanFilter.Builder()
-                .setServiceUuid(ParcelUuid(HEART_RATE_SERVICE_UUID))
-                .build()
             val settings = ScanSettings.Builder()
                 .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
                 .build()
 
-            scanner.startScan(listOf(filter), settings, scanCallback)
+            // Open scan to ensure all Garmin advertising packets are captured
+            scanner.startScan(null, settings, scanCallback)
 
             tickerHandler.postDelayed({
                 if (isScanning && stateMachine.currentHr <= 0) {
@@ -292,18 +290,24 @@ class HavenPacingService : Service() {
     private val scanCallback = object : ScanCallback() {
         override fun onScanResult(callbackType: Int, result: ScanResult?) {
             val device = result?.device ?: return
-            stopBleScan()
-            val devName = try { device.name ?: "Detected Device" } catch (e: SecurityException) { "Device" }
-            bleStatusMessage = "BLE: CONNECTING TO " + devName + "..."
-            broadcastHudUpdate()
+            val devName = try { device.name ?: "" } catch (e: SecurityException) { "" }
+            val record = result.scanRecord
+            val hasHrService = record?.serviceUuids?.any { it.uuid == HEART_RATE_SERVICE_UUID } == true
 
-            bluetoothGatt?.close()
-            bluetoothGatt = device.connectGatt(
-                this@HavenPacingService,
-                false,
-                gattCallback,
-                BluetoothDevice.TRANSPORT_LE
-            )
+            if (hasHrService || devName.contains("Garmin", true) || devName.contains("Venu", true)) {
+                stopBleScan()
+                val displayName = if (devName.isNotEmpty()) devName else "Garmin Device"
+                bleStatusMessage = "BLE: CONNECTING TO " + displayName + "..."
+                broadcastHudUpdate()
+
+                bluetoothGatt?.close()
+                bluetoothGatt = device.connectGatt(
+                    this@HavenPacingService,
+                    false,
+                    gattCallback,
+                    BluetoothDevice.TRANSPORT_LE
+                )
+            }
         }
 
         override fun onScanFailed(errorCode: Int) {
@@ -344,7 +348,7 @@ class HavenPacingService : Service() {
                         broadcastHudUpdate()
                     }
                 } else {
-                    bleStatusMessage = "BLE: HR SERVICE NOT FOUND (START BROADCAST)"
+                    bleStatusMessage = "BLE: HR SERVICE NOT FOUND"
                     broadcastHudUpdate()
                 }
             } else {
