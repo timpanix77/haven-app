@@ -217,10 +217,129 @@ class MainActivity : AppCompatActivity() {
         // Display latched peak indefinitely with Dark Blood Crimson at 115+ BPM
         if (latchedPeakHr > 0) {
             tvPeakIndicator.text = "PEAK: " + latchedPeakHr + " BPM"
-            val peakColor = when {
-                latchedPeakHr >= 115 -> Color.parseColor("#660000") // Dark Blood Crimson (Severe POTS Warning)
-                latchedPeakHr >= ceiling -> Color.parseColor("#FF5252") // Alert Red
-                latchedPeakHr >= 76 -> Color.parseColor("#FFEA00") // Warning Yellow
-                else -> Color.parseColor("#00E676") // Green
+            if (latchedPeakHr >= 115) {
+                tvPeakIndicator.setTextColor(Color.parseColor("#660000"))
+            } else if (latchedPeakHr >= ceiling) {
+                tvPeakIndicator.setTextColor(Color.parseColor("#FF5252"))
+            } else if (latchedPeakHr >= 76) {
+                tvPeakIndicator.setTextColor(Color.parseColor("#FFEA00"))
+            } else {
+                tvPeakIndicator.setTextColor(Color.parseColor("#00E676"))
             }
-            tvPeakIndicator.setTextColor(
+        } else {
+            tvPeakIndicator.text = "PEAK: --"
+            tvPeakIndicator.setTextColor(Color.parseColor("#8E8E93"))
+        }
+
+        // 3. Excursion Stopwatch & Grace Buffer
+        if (excSec > 0) {
+            lastRecordedExcursionSec = excSec
+            val m = excSec / 60
+            val s = excSec % 60
+            tvExcursion.text = String.format("%02d:%02d", m, s)
+            tvExcursion.setTextColor(Color.parseColor("#FF9100"))
+
+            vuGrace.setLevel(excSec.coerceAtMost(120).toFloat(), 120f)
+            val remainingGrace = (120 - excSec).coerceAtLeast(0)
+            tvBufferStatus.text = "ACTIVE (" + remainingGrace + "s LEFT)"
+            tvBufferStatus.setTextColor(Color.parseColor("#FF9100"))
+        } else {
+            val m = lastRecordedExcursionSec / 60
+            val s = lastRecordedExcursionSec % 60
+            tvExcursion.text = String.format("%02d:%02d", m, s)
+            tvExcursion.setTextColor(Color.WHITE)
+
+            vuGrace.setLevel(0f, 120f)
+            tvBufferStatus.text = "STANDBY"
+            tvBufferStatus.setTextColor(Color.parseColor("#636366"))
+        }
+
+        // 4. Budget Burn & Remaining Time
+        val budgetMin = budgetSec / 60
+        tvBudgetLabel.text = "DAILY BUDGET (" + budgetMin + "m CAP)"
+        vuBudget.setLevel(totalSec.toFloat(), budgetSec.toFloat())
+
+        val remainingSec = budgetSec - totalSec
+        if (remainingSec >= 0) {
+            val rM = remainingSec / 60
+            val rS = remainingSec % 60
+            tvBudgetRemaining.text = String.format("%02d:%02d", rM, rS)
+            tvBudgetRemaining.setTextColor(Color.parseColor("#00E676"))
+            tvPaceStatus.text = "PACE: ON TRACK"
+            tvPaceStatus.setTextColor(Color.parseColor("#00E676"))
+        } else {
+            val debtSec = -remainingSec
+            val dM = debtSec / 60
+            val dS = debtSec % 60
+            tvBudgetRemaining.text = String.format("-%02d:%02d", dM, dS)
+            tvBudgetRemaining.setTextColor(Color.parseColor("#FF5252"))
+            tvPaceStatus.text = "PACE: OVER BUDGET"
+            tvPaceStatus.setTextColor(Color.parseColor("#FF5252"))
+        }
+
+        // 5. Morning Stability Panel (0-100)
+        val stabilityTier = when {
+            stability >= 85 -> "[OPTIMAL]"
+            stability >= 70 -> "[STABLE]"
+            stability >= 50 -> "[GUARDED]"
+            stability >= 30 -> "[VULNERABLE]"
+            else            -> "[VETO / CRASH]"
+        }
+        tvStabilityBanner.text = "STABILITY: " + stability + "/100 " + stabilityTier + " | CEIL: " + ceiling + " | BUD: " + budgetMin + "m"
+        val bannerColor = when {
+            stability >= 70 -> Color.parseColor("#00E676")
+            stability >= 50 -> Color.parseColor("#FFEA00")
+            stability >= 30 -> Color.parseColor("#FF9100")
+            else            -> Color.parseColor("#660000")
+        }
+        tvStabilityBanner.setTextColor(bannerColor)
+
+        // 6. Cockpit Mode
+        if (mode == "COCKPIT_DARK") {
+            tvMode.text = "[ COCKPIT DARK ]"
+            tvMode.setTextColor(Color.parseColor("#757575"))
+        } else {
+            tvMode.text = "[ COCKPIT LIVE ]"
+            tvMode.setTextColor(Color.parseColor("#00E676"))
+        }
+    }
+
+    private fun checkPermissionsAndStartService() {
+        val permissions = mutableListOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            permissions.add(Manifest.permission.BLUETOOTH_SCAN)
+            permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+
+        val missing = permissions.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+
+        if (missing.isNotEmpty()) {
+            Toast.makeText(this, "Requesting OS Permissions...", Toast.LENGTH_SHORT).show()
+            ActivityCompat.requestPermissions(this, missing.toTypedArray(), 101)
+        } else {
+            startHavenService()
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
+            Toast.makeText(this, "Permissions Granted!", Toast.LENGTH_SHORT).show()
+            startHavenService()
+        } else {
+            Toast.makeText(this, "Permission Denied in OS! Enable in App Settings", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun startHavenService() {
+        val serviceIntent = Intent(this, HavenPacingService::class.java)
+        try {
+            if (Build.VERSION.SDK_
