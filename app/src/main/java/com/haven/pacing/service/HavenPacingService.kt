@@ -28,7 +28,6 @@ import android.os.ParcelUuid
 import android.speech.tts.TextToSpeech
 import androidx.core.app.NotificationCompat
 import com.haven.pacing.MainActivity
-import com.haven.pacing.R
 import com.haven.pacing.data.ExcursionRecord
 import com.haven.pacing.data.HavenDatabase
 import kotlinx.coroutines.CoroutineScope
@@ -376,7 +375,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("HAVEN Flight Deck Active")
             .setContentText(text)
-            .setSmallIcon(R.mipmap.ic_launcher)
+            .setSmallIcon(android.R.drawable.stat_notify_sync)
             .setContentIntent(pendingIntent)
             .setOngoing(true)
             .setSilent(true)
