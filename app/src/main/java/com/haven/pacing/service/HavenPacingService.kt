@@ -70,6 +70,10 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
     private var bleStatusMessage: String = "BLE: INITIALIZING"
     private var lastRolloverDay: Int = -1
 
+    // Battery Optimization: Throttle notification updates
+    private var lastNotificationUpdateTime = 0L
+    private var lastReportedExcursionState = false
+
     companion object {
         const val CHANNEL_ID = "haven_pacing_channel"
         const val NOTIFICATION_ID = 1001
@@ -173,11 +177,33 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
                 }
 
                 broadcastTelemetry()
-                updateNotification()
+                checkAndUpdateNotification()
                 mainHandler.postDelayed(this, 1000)
             }
         }
         mainHandler.post(tickerRunnable!!)
+    }
+
+    private fun checkAndUpdateNotification() {
+        val now = System.currentTimeMillis()
+        val excursionStateChanged = (isExcursionActive != lastReportedExcursionState)
+        
+        // Notification battery policy:
+        // 1. Instantly update on state change (crossing 88 BPM ceiling or recovering below floor).
+        // 2. If in active excursion (>= 88 BPM), update at most every 5 seconds.
+        // 3. If in safe zone (< 88 BPM), throttle to at most once every 60 seconds.
+        val shouldUpdate = when {
+            excursionStateChanged -> true
+            isExcursionActive && (now - lastNotificationUpdateTime >= 5_000L) -> true
+            !isExcursionActive && (now - lastNotificationUpdateTime >= 60_000L) -> true
+            else -> false
+        }
+
+        if (shouldUpdate) {
+            lastNotificationUpdateTime = now
+            lastReportedExcursionState = isExcursionActive
+            updateNotification()
+        }
     }
 
     private fun finalizeExcursion(duration: Int, peak: Int, settled: Int, points: Double) {
@@ -298,6 +324,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
                 bluetoothGatt = null
                 startBleScan()
             }
+            updateNotification()
         }
 
         override fun onServicesDiscovered(gatt: BluetoothGatt?, status: Int) {
@@ -318,6 +345,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
                                 gatt.writeDescriptor(descriptor)
                             }
                             bleStatusMessage = "BLE: LOCKED"
+                            updateNotification()
                         }
                     } catch (e: SecurityException) {}
                 }
@@ -385,7 +413,11 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
     private fun updateNotification() {
         val remaining = dailyBudgetPoints - dailyTotalPoints
         val statusText = if (currentHr > 0) {
-            String.format("HR: %d BPM | Budget: %.1f / %.0f PTS", currentHr, dailyTotalPoints, dailyBudgetPoints)
+            if (isExcursionActive) {
+                String.format("EXCURSION: %d BPM (Peak %d) | Points: %.1f", currentHr, excursionPeakHr, dailyTotalPoints)
+            } else {
+                String.format("HR: %d BPM | Budget: %.1f / %.0f PTS", currentHr, dailyTotalPoints, dailyBudgetPoints)
+            }
         } else {
             bleStatusMessage
         }
