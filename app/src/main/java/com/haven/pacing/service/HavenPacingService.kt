@@ -19,6 +19,7 @@ import android.bluetooth.le.ScanResult
 import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.Intent
+import android.content.SharedPreferences
 import android.graphics.Color
 import android.os.Build
 import android.os.Handler
@@ -48,9 +49,11 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
     private var bluetoothAdapter: BluetoothAdapter? = null
     private var bluetoothGatt: BluetoothGatt? = null
     private var isScanning = false
+    private var cachedGarminMac: String? = null
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private var tickerRunnable: Runnable? = null
+    private lateinit var prefs: SharedPreferences
 
     // Pacing Thresholds & State
     private var currentHr: Int = 0
@@ -70,13 +73,20 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
     private var bleStatusMessage: String = "BLE: INITIALIZING"
     private var lastRolloverDay: Int = -1
 
-    // Battery Optimization: Throttle notification updates
+    // Battery & Persistence Throttling
     private var lastNotificationUpdateTime = 0L
+    private var lastPrefSaveTime = 0L
     private var lastReportedExcursionState = false
 
     companion object {
         const val CHANNEL_ID = "haven_pacing_channel"
         const val NOTIFICATION_ID = 1001
+
+        const val PREFS_NAME = "haven_engine_state"
+        const val KEY_SAVED_DAY = "key_saved_day"
+        const val KEY_DAILY_POINTS = "key_daily_points"
+        const val KEY_LATCHED_PEAK = "key_latched_peak"
+        const val KEY_CACHED_MAC = "key_cached_mac"
 
         const val ACTION_HUD_UPDATE = "com.haven.pacing.ACTION_HUD_UPDATE"
         const val EXTRA_HR = "extra_hr"
@@ -103,6 +113,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
     override fun onCreate() {
         super.onCreate()
         isServiceRunning = true
+        prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         tts = TextToSpeech(this, this)
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification("Engine Active - Scanning for Garmin..."))
@@ -110,10 +121,39 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         bluetoothAdapter = bluetoothManager.adapter
 
-        lastRolloverDay = Calendar.getInstance().get(Calendar.DAY_OF_YEAR)
+        restoreEngineState()
 
-        startBleScan()
+        startBleConnectionFlow()
         startEngineTicker()
+    }
+
+    private fun restoreEngineState() {
+        val now = Calendar.getInstance()
+        val currentDay = now.get(Calendar.DAY_OF_YEAR)
+        val savedDay = prefs.getInt(KEY_SAVED_DAY, -1)
+        cachedGarminMac = prefs.getString(KEY_CACHED_MAC, null)
+
+        lastRolloverDay = currentDay
+        if (savedDay == currentDay) {
+            dailyTotalPoints = prefs.getFloat(KEY_DAILY_POINTS, 0.0f).toDouble()
+            serviceLatchedPeakHr = prefs.getInt(KEY_LATCHED_PEAK, 0)
+        } else {
+            dailyTotalPoints = 0.0
+            serviceLatchedPeakHr = 0
+            persistEngineState(force = true)
+        }
+    }
+
+    private fun persistEngineState(force: Boolean = false) {
+        val now = System.currentTimeMillis()
+        if (force || now - lastPrefSaveTime >= 5_000L) {
+            lastPrefSaveTime = now
+            prefs.edit()
+                .putInt(KEY_SAVED_DAY, lastRolloverDay)
+                .putFloat(KEY_DAILY_POINTS, dailyTotalPoints.toFloat())
+                .putInt(KEY_LATCHED_PEAK, serviceLatchedPeakHr)
+                .apply()
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -174,6 +214,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
                         excursionDurationSec++
                         currentExcursionPoints += pointsRate
                     }
+                    persistEngineState(force = false)
                 }
 
                 broadcastTelemetry()
@@ -188,10 +229,6 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         val now = System.currentTimeMillis()
         val excursionStateChanged = (isExcursionActive != lastReportedExcursionState)
         
-        // Notification battery policy:
-        // 1. Instantly update on state change (crossing 88 BPM ceiling or recovering below floor).
-        // 2. If in active excursion (>= 88 BPM), update at most every 5 seconds.
-        // 3. If in safe zone (< 88 BPM), throttle to at most once every 60 seconds.
         val shouldUpdate = when {
             excursionStateChanged -> true
             isExcursionActive && (now - lastNotificationUpdateTime >= 5_000L) -> true
@@ -207,6 +244,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
     }
 
     private fun finalizeExcursion(duration: Int, peak: Int, settled: Int, points: Double) {
+        persistEngineState(force = true)
         serviceScope.launch {
             try {
                 val db = HavenDatabase.getDatabase(this@HavenPacingService)
@@ -233,6 +271,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
             lastRolloverDay = currentDay
             dailyTotalPoints = 0.0
             serviceLatchedPeakHr = 0
+            persistEngineState(force = true)
         }
     }
 
@@ -255,11 +294,31 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         onTelemetryUpdate?.invoke(currentHr, excursionDurationSec, (dailyTotalPoints * 60).toInt(), "COCKPIT_LIVE")
     }
 
-    private fun startBleScan() {
+    private fun startBleConnectionFlow() {
         if (bluetoothAdapter == null || !bluetoothAdapter!!.isEnabled) {
             bleStatusMessage = "BLE: BLUETOOTH OFF"
             return
         }
+
+        // Fast Path: Direct hardware connect if we already know this Garmin's MAC
+        val savedMac = cachedGarminMac ?: prefs.getString(KEY_CACHED_MAC, null)
+        if (!savedMac.isNullOrEmpty()) {
+            try {
+                val device = bluetoothAdapter?.getRemoteDevice(savedMac)
+                if (device != null) {
+                    bleStatusMessage = "BLE: RE-LATCHING..."
+                    bluetoothGatt = device.connectGatt(this, true, gattCallback)
+                    return
+                }
+            } catch (e: Exception) {
+                // Fall back to scanning if direct connect fails
+            }
+        }
+
+        startBleScan()
+    }
+
+    private fun startBleScan() {
         val scanner = bluetoothAdapter?.bluetoothLeScanner
         if (scanner == null) {
             bleStatusMessage = "BLE: SCANNER UNAVAILABLE"
@@ -273,7 +332,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
             .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
             .build()
 
-        bleStatusMessage = "BLE: SEARCHING FOR GARMIN..."
+        bleStatusMessage = "BLE: SEARCHING..."
         isScanning = true
         try {
             scanner.startScan(listOf(filter), settings, scanCallback)
@@ -291,6 +350,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
                     } catch (e: SecurityException) {}
                     isScanning = false
                 }
+                cacheDeviceMac(device.address)
                 connectToDevice(device)
             }
         }
@@ -299,6 +359,11 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
             bleStatusMessage = "BLE: SCAN FAILED ($errorCode)"
             isScanning = false
         }
+    }
+
+    private fun cacheDeviceMac(address: String) {
+        cachedGarminMac = address
+        prefs.edit().putString(KEY_CACHED_MAC, address).apply()
     }
 
     private fun connectToDevice(device: BluetoothDevice) {
@@ -314,6 +379,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         override fun onConnectionStateChange(gatt: BluetoothGatt?, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
                 bleStatusMessage = "BLE: CONNECTED - DISCOVERING"
+                gatt?.device?.address?.let { cacheDeviceMac(it) }
                 try {
                     gatt?.discoverServices()
                 } catch (e: SecurityException) {}
@@ -322,7 +388,9 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
                 currentHr = 0
                 gatt?.close()
                 bluetoothGatt = null
-                startBleScan()
+                mainHandler.postDelayed({
+                    startBleConnectionFlow()
+                }, 2000)
             }
             updateNotification()
         }
@@ -411,7 +479,6 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
     }
 
     private fun updateNotification() {
-        val remaining = dailyBudgetPoints - dailyTotalPoints
         val statusText = if (currentHr > 0) {
             if (isExcursionActive) {
                 String.format("EXCURSION: %d BPM (Peak %d) | Points: %.1f", currentHr, excursionPeakHr, dailyTotalPoints)
@@ -427,6 +494,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
 
     override fun onDestroy() {
         isServiceRunning = false
+        persistEngineState(force = true)
         tickerRunnable?.let { mainHandler.removeCallbacks(it) }
         serviceScope.cancel()
         try {
