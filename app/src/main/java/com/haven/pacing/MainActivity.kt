@@ -10,6 +10,7 @@ import android.graphics.Color
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Environment
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
@@ -18,12 +19,16 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.lifecycleScope
+import com.haven.pacing.data.ExcursionRecord
 import com.haven.pacing.data.HavenDatabase
 import com.haven.pacing.data.VaultManager
 import com.haven.pacing.service.HavenPacingService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
 
 class MainActivity : AppCompatActivity() {
 
@@ -57,11 +62,7 @@ class MainActivity : AppCompatActivity() {
     ) { uri: Uri? ->
         if (uri != null) {
             lifecycleScope.launch(Dispatchers.IO) {
-                val count = vaultManager.restoreVaultFromUri(this@MainActivity, uri)
-                withContext(Dispatchers.Main) {
-                    val msg = if (count >= 0) "Restored $count Excursions!" else "Restore Failed"
-                    Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show()
-                }
+                restoreFromUriWithFallback(uri)
             }
         } else {
             Toast.makeText(this, "Restore Cancelled", Toast.LENGTH_SHORT).show()
@@ -136,11 +137,139 @@ class MainActivity : AppCompatActivity() {
         }
 
         btnRestore.setOnClickListener {
-            restoreFileLauncher.launch(arrayOf("application/json", "*/*"))
+            lifecycleScope.launch(Dispatchers.IO) {
+                val autoRestored = tryAutoRestoreFromDownloads()
+                if (autoRestored > 0) {
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(this@MainActivity, "Auto-Restored $autoRestored Excursions!", Toast.LENGTH_SHORT).show()
+                    }
+                } else {
+                    withContext(Dispatchers.Main) {
+                        try {
+                            restoreFileLauncher.launch(arrayOf("*/*"))
+                        } catch (e: Exception) {
+                            Toast.makeText(this@MainActivity, "Picker Error: ${e.message}", Toast.LENGTH_LONG).show()
+                        }
+                    }
+                }
+            }
         }
 
         renderTelemetry(0, 0, 0, 0.0, 20.0, 0.0, 75, 88, "COCKPIT_LIVE", "BLE: READY - TAP 'ARM' TO START")
         checkPermissionsAndStartService()
+    }
+
+    private suspend fun tryAutoRestoreFromDownloads(): Int {
+        val candidates = listOf(
+            "haven_vault_export.json",
+            "haven_vault_backup.json",
+            "haven_vault.json"
+        )
+        val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        if (downloadsDir != null && downloadsDir.exists()) {
+            for (name in candidates) {
+                val file = File(downloadsDir, name)
+                if (file.exists() && file.length() > 0L) {
+                    try {
+                        val count = parseAndInsertExcursions(file.readText())
+                        if (count > 0) return count
+                    } catch (e: Exception) {
+                        // Skip unreadable files and fall back to picker
+                    }
+                }
+            }
+        }
+        return -1
+    }
+
+    private suspend fun restoreFromUriWithFallback(uri: Uri) {
+        var count = -1
+        try {
+            count = vaultManager.restoreVaultFromUri(this@MainActivity, uri)
+        } catch (e: Exception) {
+            count = -1
+        }
+
+        if (count >= 0) {
+            withContext(Dispatchers.Main) {
+                Toast.makeText(this@MainActivity, "Restored $count Excursions!", Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
+
+        // Bulletproof Stream Fallback: Direct content:// stream reading & flexible JSON decoding
+        try {
+            val jsonText = contentResolver.openInputStream(uri)?.use { stream ->
+                stream.bufferedReader().readText()
+            }
+            if (!jsonText.isNullOrEmpty()) {
+                val fallbackCount = parseAndInsertExcursions(jsonText)
+                withContext(Dispatchers.Main) {
+                    if (fallbackCount >= 0) {
+                        Toast.makeText(this@MainActivity, "Restored $fallbackCount Excursions!", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(this@MainActivity, "Restore Failed: Empty or invalid vault", Toast.LENGTH_LONG).show()
+                    }
+                }
+            } else {
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(this@MainActivity, "Restore Failed: Could not read file stream", Toast.LENGTH_LONG).show()
+                }
+            }
+        } catch (e: Exception) {
+            withContext(Dispatchers.Main) {
+                Toast.makeText(this@MainActivity, "Restore Error: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    private suspend fun parseAndInsertExcursions(jsonString: String): Int {
+        val trimmed = jsonString.trim()
+        val jsonArray = if (trimmed.startsWith("[")) {
+            JSONArray(trimmed)
+        } else {
+            val obj = JSONObject(trimmed)
+            when {
+                obj.has("records") -> obj.getJSONArray("records")
+                obj.has("excursions") -> obj.getJSONArray("excursions")
+                obj.has("data") -> obj.getJSONArray("data")
+                else -> {
+                    var found: JSONArray? = null
+                    val keys = obj.keys()
+                    while (keys.hasNext()) {
+                        val key = keys.next()
+                        val v = obj.optJSONArray(key)
+                        if (v != null) {
+                            found = v
+                            break
+                        }
+                    }
+                    found ?: return -1
+                }
+            }
+        }
+
+        val db = HavenDatabase.getDatabase(this@MainActivity)
+        var count = 0
+        for (i in 0 until jsonArray.length()) {
+            val item = jsonArray.getJSONObject(i)
+            val ts = item.optLong("timestamp", item.optLong("time", System.currentTimeMillis()))
+            val dur = item.optInt("durationSeconds", item.optInt("duration", 0))
+            val peak = item.optInt("peakHr", item.optInt("peak", 0))
+            val settled = item.optInt("settledHr", item.optInt("settled", 0))
+            val strain = item.optDouble("strainPoints", item.optDouble("points", 0.0))
+
+            val record = ExcursionRecord(
+                timestamp = ts,
+                durationSeconds = dur,
+                peakHr = peak,
+                settledHr = settled,
+                strainPoints = strain
+            )
+            db.havenDao().insert(record)
+            count++
+        }
+        return count
     }
 
     override fun onResume() {
