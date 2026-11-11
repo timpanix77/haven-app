@@ -1,4 +1,4 @@
-package com.haven.autonomic
+package com.haven.pacing.service
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -21,13 +21,11 @@ import android.os.Build
 import android.os.IBinder
 import android.os.SystemClock
 import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
 import androidx.core.app.NotificationCompat
 import androidx.health.connect.client.HealthConnectClient
 import androidx.health.connect.client.records.HeartRateVariabilityRmssdRecord
 import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.time.TimeRangeFilter
-import androidx.preference.PreferenceManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -76,7 +74,8 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
 
     override fun onCreate() {
         super.onCreate()
-        prefs = PreferenceManager.getDefaultSharedPreferences(this)
+        isServiceRunning = true
+        prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
         initTextToSpeech()
         createNotificationChannel()
@@ -104,6 +103,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
     override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onDestroy() {
+        isServiceRunning = false
         serviceScope.cancel()
         disconnectGatt()
         tts?.stop()
@@ -121,9 +121,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         try {
             val device = adapter.getRemoteDevice(deviceAddress)
             bluetoothGatt = device.connectGatt(this, false, gattCallback)
-        } catch (e: SecurityException) {
-            // Log or handle missing BLUETOOTH_CONNECT permission
-        }
+        } catch (e: SecurityException) { }
     }
 
     private fun disconnectGatt() {
@@ -131,9 +129,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
             bluetoothGatt?.disconnect()
             bluetoothGatt?.close()
             bluetoothGatt = null
-        } catch (e: SecurityException) {
-            // Handled
-        }
+        } catch (e: SecurityException) { }
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
@@ -227,7 +223,6 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         val deltaSeconds = if (lastTickTimestampMs == 0L) 1.0 else (nowElapsed - lastTickTimestampMs) / 1000.0
         lastTickTimestampMs = nowElapsed
 
-        // Excursion boundary monitoring
         if (hr >= activeCeilingBpm) {
             if (!isExcursionActive) {
                 isExcursionActive = true
@@ -236,7 +231,6 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
             val excursionDurationMs = nowElapsed - excursionStartElapsedMs
             lastExcursionDurationSeconds = excursionDurationMs / 1000L
 
-            // Only deduct strain points if the 120s (or 60s) grace buffer has lapsed
             if (excursionDurationMs > graceBufferDurationMs) {
                 val strainRatePerMinute = calculatePiecewiseStrainRate(hr)
                 val burn = (strainRatePerMinute / 60.0) * currentPostureMultiplier * deltaSeconds
@@ -247,7 +241,6 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
             }
         } else {
             if (isExcursionActive) {
-                // Recovered below ceiling
                 isExcursionActive = false
                 lastExcursionDurationSeconds = (nowElapsed - excursionStartElapsedMs) / 1000L
             }
@@ -263,11 +256,11 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
             hr in 89..95 -> 0.12
             hr in 96..105 -> 0.45
             hr in 106..114 -> 1.20
-            else -> 2.40 // >= 115 BPM
+            else -> 2.40
         }
     }
 
-    // --- Auditory Warning Engine (Stream & Focus Routing) ---
+    // --- Auditory Warning Engine ---
 
     private fun initTextToSpeech() {
         tts = TextToSpeech(this, this)
@@ -277,7 +270,6 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         if (status == TextToSpeech.SUCCESS) {
             tts?.language = Locale.US
 
-            // USAGE_ASSISTANCE_NAVIGATION_GUIDANCE bypasses notification channel mutes
             val audioAttributes = AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
                 .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
@@ -291,7 +283,6 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
     private fun checkVoiceWarningTrigger(nowElapsed: Long, excursionDurationMs: Long) {
         if (!ttsInitialized) return
 
-        // Throttle auditory alerts to once every 45 seconds during an active breached excursion
         if (nowElapsed - lastSpokenAlertElapsedMs > 45_000L) {
             lastSpokenAlertElapsedMs = nowElapsed
             val secondsOver = excursionDurationMs / 1000L
@@ -321,13 +312,10 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
                 val response = healthConnectClient.readRecords(request)
                 val latestRecord = response.records.maxByOrNull { it.time }
 
-                latestRecord?.let {
-                    val rmssd = it.heartRateVariabilityMillis
-                    applyAutomatedHrvGovernor(rmssd)
+                latestRecord?.let { record ->
+                    applyAutomatedHrvGovernor(record.heartRateVariabilityMillis)
                 }
-            } catch (e: Exception) {
-                // Health Connect not available, permitted, or no overnight record yet
-            }
+            } catch (e: Exception) { }
         }
     }
 
@@ -341,19 +329,16 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
 
         when {
             ratio >= 1.0 -> {
-                // Optimal recovery / Full tank
                 dynamicBudget = 20.0f
                 dynamicCeiling = 88
                 dynamicGraceSec = 120L
             }
             ratio >= 0.80 -> {
-                // Caution / Compromised tank
                 dynamicBudget = 14.0f
                 dynamicCeiling = 84
                 dynamicGraceSec = 60L
             }
             else -> {
-                // Suppressed / Malaise Lockdown
                 dynamicBudget = 10.0f
                 dynamicCeiling = 84
                 dynamicGraceSec = 60L
@@ -382,7 +367,6 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         val savedPacingDate = prefs.getString(KEY_POINTS_DATE, "")
 
         if (savedPacingDate != currentPacingDate) {
-            // 04:00 AM Boundary crossed: wipe accumulators and restore clean baseline
             dailyBudgetRemaining = BASE_DAILY_BUDGET
             dailyPeakHr = currentHr
             lastExcursionDurationSeconds = 0L
@@ -393,10 +377,8 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
                 .putFloat(KEY_BUDGET_REMAINING, BASE_DAILY_BUDGET.toFloat())
                 .apply()
 
-            // Check for new sleep HRV session
             attemptAutomatedHrvGovernor()
         } else {
-            // Same day: load persisted budget float
             dailyBudgetRemaining = prefs.getFloat(KEY_BUDGET_REMAINING, BASE_DAILY_BUDGET.toFloat()).toDouble()
             activeCeilingBpm = prefs.getInt(KEY_ACTIVE_CEILING, DEFAULT_CEILING_BPM)
             graceBufferDurationMs = prefs.getLong(KEY_GRACE_SEC, DEFAULT_GRACE_BUFFER_MS / 1000L) * 1000L
@@ -406,7 +388,6 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
 
     private fun getCurrentPacingDayStamp(): String {
         val cal = Calendar.getInstance()
-        // If before 04:00 AM, this time window belongs to the previous day's budget
         if (cal.get(Calendar.HOUR_OF_DAY) < 4) {
             cal.add(Calendar.DAY_OF_YEAR, -1)
         }
@@ -420,7 +401,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
             .apply()
     }
 
-    // --- UI Synchronization & Foreground Service Notification ---
+    // --- Broadcast & Notification Sync ---
 
     private fun broadcastTelemetryUpdate() {
         val intent = Intent(ACTION_TELEMETRY_UPDATE).apply {
@@ -485,6 +466,9 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
     companion object {
         const val CHANNEL_ID = "haven_telemetry_channel"
         const val NOTIFICATION_ID = 1042
+        const val PREFS_NAME = "haven_pacing_prefs"
+
+        var isServiceRunning: Boolean = false
 
         // Standard Defaults
         const val BASE_DAILY_BUDGET = 20.0
@@ -500,7 +484,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         const val KEY_GRACE_SEC = "grace_buffer_sec"
 
         // Broadcast Action & Extras
-        const val ACTION_TELEMETRY_UPDATE = "com.haven.autonomic.ACTION_TELEMETRY_UPDATE"
+        const val ACTION_TELEMETRY_UPDATE = "com.haven.pacing.ACTION_TELEMETRY_UPDATE"
         const val EXTRA_CURRENT_HR = "extra_current_hr"
         const val EXTRA_PEAK_HR = "extra_peak_hr"
         const val EXTRA_BUDGET_REMAINING = "extra_budget_remaining"
