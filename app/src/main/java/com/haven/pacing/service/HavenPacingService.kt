@@ -1,54 +1,31 @@
 package com.haven.pacing.service
 
-import android.app.Notification
-import android.app.NotificationChannel
-import android.app.NotificationManager
-import android.app.PendingIntent
-import android.app.Service
-import android.bluetooth.BluetoothAdapter
-import android.bluetooth.BluetoothGatt
-import android.bluetooth.BluetoothGattCallback
-import android.bluetooth.BluetoothGattCharacteristic
-import android.bluetooth.BluetoothGattDescriptor
-import android.bluetooth.BluetoothManager
-import android.bluetooth.BluetoothProfile
-import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanFilter
-import android.bluetooth.le.ScanResult
-import android.bluetooth.le.ScanSettings
-import android.content.Context
-import android.content.Intent
-import android.content.SharedPreferences
-import android.media.AudioAttributes
-import android.os.Binder
-import android.os.Build
-import android.os.IBinder
-import android.os.ParcelUuid
-import android.os.SystemClock
-import android.speech.tts.TextToSpeech
+import android.app.*
+import android.bluetooth.*
+import android.bluetooth.le.*
+import android.content.*
+import android.media.*
+import android.os.*
+import android.speech.tts.*
 import androidx.core.app.NotificationCompat
 import androidx.health.connect.client.HealthConnectClient
 import androidx.health.connect.client.records.HeartRateVariabilityRmssdRecord
 import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.time.TimeRangeFilter
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.cancel
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.*
 import java.text.SimpleDateFormat
 import java.time.Instant
 import java.time.temporal.ChronoUnit
-import java.util.Calendar
-import java.util.Locale
-import java.util.UUID
+import java.util.*
 
 class HavenPacingService : Service(), TextToSpeech.OnInitListener {
 
     private val binder = LocalBinder()
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-
     private lateinit var prefs: SharedPreferences
+    private lateinit var audioManager: AudioManager
+    private var audioFocusRequest: AudioFocusRequest? = null
+
     private var tts: TextToSpeech? = null
     private var ttsReady = false
 
@@ -56,7 +33,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
     private var isConnected = false
     private var isScanning = false
 
-    // Telemetry & Autonomic State
+    // Real-Time Autonomic State
     private var currentHr = 0
     private var dailyPeakHr = 0
     private var activeCeiling = DEFAULT_CEILING_BPM
@@ -83,8 +60,9 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         super.onCreate()
         isServiceRunning = true
         prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
 
-        tts = TextToSpeech(this, this)
+        initTts()
         createNotificationChannel()
         startForeground(NOTIFICATION_ID, buildNotification("HAVEN Telemetry Initializing..."))
 
@@ -101,12 +79,72 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         isServiceRunning = false
         scope.cancel()
         stopBle()
+        abandonDucking()
         tts?.stop()
         tts?.shutdown()
         super.onDestroy()
     }
 
-    // --- BLE Ingress & Auto-Discovery ---
+    // --- Audio Focus Ducker Engine ---
+
+    private fun initTts() {
+        tts = TextToSpeech(this, this)
+    }
+
+    override fun onInit(status: Int) {
+        if (status == TextToSpeech.SUCCESS) {
+            tts?.language = Locale.US
+            tts?.setAudioAttributes(
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+            )
+            tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                override fun onStart(utteranceId: String?) {}
+                override fun onDone(utteranceId: String?) { abandonDucking() }
+                override fun onError(utteranceId: String?) { abandonDucking() }
+            })
+            ttsReady = true
+        }
+    }
+
+    private fun requestDucking() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val attr = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build()
+            audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+                .setAudioAttributes(attr)
+                .setAcceptsDelayedFocusGain(false)
+                .setOnAudioFocusChangeListener { }
+                .build()
+            audioFocusRequest?.let { audioManager.requestAudioFocus(it) }
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.requestAudioFocus(null, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+        }
+    }
+
+    private fun abandonDucking() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            audioFocusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
+        } else {
+            @Suppress("DEPRECATION")
+            audioManager.abandonAudioFocus(null)
+        }
+    }
+
+    private fun speakAlert(message: String) {
+        if (!ttsReady) return
+        requestDucking()
+        val params = Bundle()
+        params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, "HAVEN_ALERT")
+        tts?.speak(message, TextToSpeech.QUEUE_FLUSH, params, "HAVEN_ALERT")
+    }
+
+    // --- BLE Telemetry Ingress & Auto-Discovery ---
 
     private fun startBleAutoConnect() {
         val adapter = (getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter ?: return
@@ -149,9 +187,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
     private fun stopScan() {
         if (!isScanning) return
         val scanner = (getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter?.bluetoothLeScanner
-        try {
-            scanner?.stopScan(scanCallback)
-        } catch (_: SecurityException) { }
+        try { scanner?.stopScan(scanCallback) } catch (_: SecurityException) { }
         isScanning = false
     }
 
@@ -181,9 +217,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
                 isConnected = true
                 bleStatus = "BLE: CONNECTED"
                 broadcastHud()
-                try {
-                    g.discoverServices()
-                } catch (_: SecurityException) { }
+                try { g.discoverServices() } catch (_: SecurityException) { }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 isConnected = false
                 currentHr = 0
@@ -211,7 +245,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
             }
         }
 
-        @Deprecated("Android 12 and below compatibility")
+        @Deprecated("Android 12 compatibility")
         override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic) {
             if (c.uuid == UUID_HR_MEASURE) {
                 val format = if ((c.getIntValue(BluetoothGattCharacteristic.FORMAT_UINT8, 0) and 0x01) != 0) {
@@ -226,11 +260,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray) {
             if (c.uuid == UUID_HR_MEASURE) {
                 val is16 = (value[0].toInt() and 0x01) != 0
-                val hr = if (is16) {
-                    ((value[2].toInt() and 0xFF) shl 8) or (value[1].toInt() and 0xFF)
-                } else {
-                    value[1].toInt() and 0xFF
-                }
+                val hr = if (is16) ((value[2].toInt() and 0xFF) shl 8) or (value[1].toInt() and 0xFF) else value[1].toInt() and 0xFF
                 parseHr(hr)
             }
         }
@@ -272,7 +302,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
                 excursionBurn += pts
                 prefs.edit().putFloat(KEY_DAILY_BURN, dailyBurn.toFloat()).apply()
 
-                if (ttsReady && now - lastAlertMs > 45_000L) {
+                if (now - lastAlertMs > 45_000L) {
                     lastAlertMs = now
                     val remaining = budgetCap - dailyBurn
                     val msg = if (remaining <= 0.0) {
@@ -280,7 +310,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
                     } else {
                         "Ceiling breached. Heart rate $currentHr."
                     }
-                    tts?.speak(msg, TextToSpeech.QUEUE_FLUSH, null, "HAVEN_ALERT")
+                    speakAlert(msg)
                 }
             }
         } else {
@@ -373,20 +403,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
-    // --- Audio, Notification & HUD Sync ---
-
-    override fun onInit(status: Int) {
-        if (status == TextToSpeech.SUCCESS) {
-            tts?.language = Locale.US
-            tts?.setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build()
-            )
-            ttsReady = true
-        }
-    }
+    // --- Audio, HUD & Notification Sync ---
 
     private fun broadcastHud() {
         val intent = Intent(ACTION_HUD_UPDATE).apply {
