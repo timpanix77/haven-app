@@ -93,13 +93,11 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
 
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
-            // Restore British voice locale
             tts?.language = Locale.UK
 
-            // Prefer British English female voice if installed on device
             try {
-                val britishVoices = tts?.voices?.filter { 
-                    it.locale.language == Locale.UK.language && it.locale.country == Locale.UK.country 
+                val britishVoices = tts?.voices?.filter {
+                    it.locale.language == Locale.UK.language && it.locale.country == Locale.UK.country
                 }
                 val femaleVoice = britishVoices?.firstOrNull { it.name.lowercase().contains("female") }
                     ?: britishVoices?.firstOrNull()
@@ -337,7 +335,6 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
 
         updateNotification()
         broadcastHud()
-        onTelemetryUpdate?.invoke(currentHr, excursionDurationSec.toInt(), (dailyBurn * 60).toInt(), "COCKPIT_LIVE")
     }
 
     // --- Automated HRV Capacity Governor ---
