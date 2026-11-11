@@ -1,4 +1,4 @@
-package com.haven.pacing.service
+package com.haven.autonomic
 
 import android.app.Notification
 import android.app.NotificationChannel
@@ -6,503 +6,516 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.bluetooth.BluetoothAdapter
-import android.bluetooth.BluetoothDevice
 import android.bluetooth.BluetoothGatt
 import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.BluetoothGattDescriptor
 import android.bluetooth.BluetoothManager
 import android.bluetooth.BluetoothProfile
-import android.bluetooth.le.ScanCallback
-import android.bluetooth.le.ScanFilter
-import android.bluetooth.le.ScanResult
-import android.bluetooth.le.ScanSettings
 import android.content.Context
 import android.content.Intent
 import android.content.SharedPreferences
-import android.graphics.Color
+import android.media.AudioAttributes
+import android.os.Binder
 import android.os.Build
-import android.os.Handler
 import android.os.IBinder
-import android.os.Looper
-import android.os.ParcelUuid
+import android.os.SystemClock
 import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import androidx.core.app.NotificationCompat
-import com.haven.pacing.MainActivity
-import com.haven.pacing.data.ExcursionRecord
-import com.haven.pacing.data.HavenDatabase
+import androidx.health.connect.client.HealthConnectClient
+import androidx.health.connect.client.records.HeartRateVariabilityRmssdRecord
+import androidx.health.connect.client.request.ReadRecordsRequest
+import androidx.health.connect.client.time.TimeRangeFilter
+import androidx.preference.PreferenceManager
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import java.text.SimpleDateFormat
+import java.time.Instant
+import java.time.temporal.ChronoUnit
 import java.util.Calendar
 import java.util.Locale
 import java.util.UUID
 
 class HavenPacingService : Service(), TextToSpeech.OnInitListener {
 
-    private val serviceScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
-    private var tts: TextToSpeech? = null
-    private var ttsReady = false
+    private val binder = LocalBinder()
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
-    private var bluetoothAdapter: BluetoothAdapter? = null
-    private var bluetoothGatt: BluetoothGatt? = null
-    private var isScanning = false
-    private var cachedGarminMac: String? = null
-
-    private val mainHandler = Handler(Looper.getMainLooper())
-    private var tickerRunnable: Runnable? = null
     private lateinit var prefs: SharedPreferences
+    private var tts: TextToSpeech? = null
+    private var ttsInitialized = false
 
-    // Pacing Thresholds & State
-    private var currentHr: Int = 0
-    private var floorHr: Int = 75
-    private var activeCeiling: Int = 88
-    private var stabilityScore: Int = 75
-    private var serviceLatchedPeakHr: Int = 0
+    private var bluetoothGatt: BluetoothGatt? = null
+    private var isConnected = false
 
-    // Full Weighted PacePoint Engine (Visible / Workwell Model)
-    private var dailyBudgetPoints: Double = 20.0
-    private var dailyTotalPoints: Double = 0.0
-    private var currentExcursionPoints: Double = 0.0
-    private var excursionDurationSec: Int = 0
-    private var isExcursionActive: Boolean = false
-    private var excursionPeakHr: Int = 0
+    // Telemetry State
+    private var currentHr = 0
+    private var dailyPeakHr = 0
+    private var activeCeilingBpm = DEFAULT_CEILING_BPM
+    private var graceBufferDurationMs = DEFAULT_GRACE_BUFFER_MS
+    private var dailyBudgetRemaining = BASE_DAILY_BUDGET
+    private var morningHrvRmssd = 0.0
 
-    private var bleStatusMessage: String = "BLE: INITIALIZING"
-    private var lastRolloverDay: Int = -1
+    // Excursion Tracking
+    private var isExcursionActive = false
+    private var excursionStartElapsedMs = 0L
+    private var lastExcursionDurationSeconds = 0L
+    private var lastTickTimestampMs = 0L
+    private var lastSpokenAlertElapsedMs = 0L
 
-    // Battery & Persistence Throttling
-    private var lastNotificationUpdateTime = 0L
-    private var lastPrefSaveTime = 0L
-    private var lastReportedExcursionState = false
+    // Posture multiplier (0.20 = Supine, 0.70 = Seated, 1.00 = Upright)
+    private var currentPostureMultiplier = 1.00
 
-    companion object {
-        const val CHANNEL_ID = "haven_pacing_channel"
-        const val NOTIFICATION_ID = 1001
-
-        const val PREFS_NAME = "haven_engine_state"
-        const val KEY_SAVED_DAY = "key_saved_day"
-        const val KEY_DAILY_POINTS = "key_daily_points"
-        const val KEY_LATCHED_PEAK = "key_latched_peak"
-        const val KEY_CACHED_MAC = "key_cached_mac"
-
-        const val ACTION_HUD_UPDATE = "com.haven.pacing.ACTION_HUD_UPDATE"
-        const val EXTRA_HR = "extra_hr"
-        const val EXTRA_EXCURSION_SEC = "extra_excursion_sec"
-        const val EXTRA_PEAK_HR = "extra_peak_hr"
-        const val EXTRA_DAILY_POINTS = "extra_daily_points"
-        const val EXTRA_DAILY_TOTAL_SEC = "extra_daily_total_sec"
-        const val EXTRA_BUDGET_POINTS = "extra_budget_points"
-        const val EXTRA_BUDGET_SEC = "extra_budget_sec"
-        const val EXTRA_EXCURSION_POINTS = "extra_excursion_points"
-        const val EXTRA_STABILITY_SCORE = "extra_stability_score"
-        const val EXTRA_ACTIVE_CEILING = "extra_active_ceiling"
-        const val EXTRA_MODE = "extra_mode"
-        const val EXTRA_BLE_STATUS = "extra_ble_status"
-
-        var isServiceRunning: Boolean = false
-        var onTelemetryUpdate: ((Int, Int, Int, String) -> Unit)? = null
-
-        val UUID_HR_SERVICE: UUID = UUID.fromString("0000180d-0000-1000-8000-00805f9b34fb")
-        val UUID_HR_CHARACTERISTIC: UUID = UUID.fromString("00002a37-0000-1000-8000-00805f9b34fb")
-        val UUID_CLIENT_CONFIG: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+    inner class LocalBinder : Binder() {
+        fun getService(): HavenPacingService = this@HavenPacingService
     }
 
     override fun onCreate() {
         super.onCreate()
-        isServiceRunning = true
-        prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        tts = TextToSpeech(this, this)
+        prefs = PreferenceManager.getDefaultSharedPreferences(this)
+
+        initTextToSpeech()
         createNotificationChannel()
-        startForeground(NOTIFICATION_ID, buildNotification("Engine Active - Scanning for Garmin..."))
+        startForeground(NOTIFICATION_ID, buildForegroundNotification("Initializing HAVEN Telemetry..."))
 
-        val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
-        bluetoothAdapter = bluetoothManager.adapter
-
-        restoreEngineState()
-
-        startBleConnectionFlow()
-        startEngineTicker()
-    }
-
-    private fun restoreEngineState() {
-        val now = Calendar.getInstance()
-        val currentDay = now.get(Calendar.DAY_OF_YEAR)
-        val savedDay = prefs.getInt(KEY_SAVED_DAY, -1)
-        cachedGarminMac = prefs.getString(KEY_CACHED_MAC, null)
-
-        lastRolloverDay = currentDay
-        if (savedDay == currentDay) {
-            dailyTotalPoints = prefs.getFloat(KEY_DAILY_POINTS, 0.0f).toDouble()
-            serviceLatchedPeakHr = prefs.getInt(KEY_LATCHED_PEAK, 0)
-        } else {
-            dailyTotalPoints = 0.0
-            serviceLatchedPeakHr = 0
-            persistEngineState(force = true)
-        }
-    }
-
-    private fun persistEngineState(force: Boolean = false) {
-        val now = System.currentTimeMillis()
-        if (force || now - lastPrefSaveTime >= 5_000L) {
-            lastPrefSaveTime = now
-            prefs.edit()
-                .putInt(KEY_SAVED_DAY, lastRolloverDay)
-                .putFloat(KEY_DAILY_POINTS, dailyTotalPoints.toFloat())
-                .putInt(KEY_LATCHED_PEAK, serviceLatchedPeakHr)
-                .apply()
-        }
+        evaluateDailyRollover()
+        attemptAutomatedHrvGovernor()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        intent?.let {
+            if (it.hasExtra(EXTRA_POSTURE_MULTIPLIER)) {
+                currentPostureMultiplier = it.getDoubleExtra(EXTRA_POSTURE_MULTIPLIER, 1.00)
+            }
+            if (it.hasExtra(EXTRA_DEVICE_ADDRESS)) {
+                val address = it.getStringExtra(EXTRA_DEVICE_ADDRESS)
+                if (!address.isNullOrEmpty()) {
+                    connectToDevice(address)
+                }
+            }
+        }
         return START_STICKY
     }
 
-    override fun onBind(intent: Intent?): IBinder? = null
+    override fun onBind(intent: Intent?): IBinder = binder
 
-    override fun onInit(status: Int) {
-        if (status == TextToSpeech.SUCCESS) {
-            tts?.language = Locale.US
-            ttsReady = true
-        }
+    override fun onDestroy() {
+        serviceScope.cancel()
+        disconnectGatt()
+        tts?.stop()
+        tts?.shutdown()
+        super.onDestroy()
     }
 
-    private fun calculatePacePointsPerSecond(hr: Int, ceiling: Int): Double {
-        if (hr <= ceiling) return 0.0
-        return when {
-            hr <= 95 -> 0.12 / 60.0   // 0.12 pts/min: Light Orthostatic
-            hr <= 105 -> 0.45 / 60.0  // 0.45 pts/min: Moderate Active
-            hr <= 114 -> 1.20 / 60.0  // 1.20 pts/min: Anaerobic Exertion
-            else -> 2.40 / 60.0       // 2.40 pts/min: Severe Surge (115+ BPM)
-        }
-    }
+    // --- Bluetooth Low Energy Telemetry Ingress ---
 
-    private fun startEngineTicker() {
-        tickerRunnable = object : Runnable {
-            override fun run() {
-                check0400Rollover()
+    fun connectToDevice(deviceAddress: String) {
+        val bluetoothManager = getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager
+        val adapter = bluetoothManager?.adapter
+        if (adapter == null || !adapter.isEnabled) return
 
-                if (currentHr > 0) {
-                    val pointsRate = calculatePacePointsPerSecond(currentHr, activeCeiling)
-                    dailyTotalPoints += pointsRate
-
-                    if (currentHr > serviceLatchedPeakHr) {
-                        serviceLatchedPeakHr = currentHr
-                    }
-
-                    if (currentHr >= activeCeiling) {
-                        if (!isExcursionActive) {
-                            isExcursionActive = true
-                            excursionDurationSec = 0
-                            currentExcursionPoints = 0.0
-                            excursionPeakHr = currentHr
-                        }
-                        excursionDurationSec++
-                        currentExcursionPoints += pointsRate
-                        if (currentHr > excursionPeakHr) {
-                            excursionPeakHr = currentHr
-                        }
-                    } else if (currentHr <= floorHr && isExcursionActive) {
-                        finalizeExcursion(excursionDurationSec, excursionPeakHr, currentHr, currentExcursionPoints)
-                        isExcursionActive = false
-                        excursionDurationSec = 0
-                        currentExcursionPoints = 0.0
-                        excursionPeakHr = 0
-                    } else if (isExcursionActive) {
-                        excursionDurationSec++
-                        currentExcursionPoints += pointsRate
-                    }
-                    persistEngineState(force = false)
-                }
-
-                broadcastTelemetry()
-                checkAndUpdateNotification()
-                mainHandler.postDelayed(this, 1000)
-            }
-        }
-        mainHandler.post(tickerRunnable!!)
-    }
-
-    private fun checkAndUpdateNotification() {
-        val now = System.currentTimeMillis()
-        val excursionStateChanged = (isExcursionActive != lastReportedExcursionState)
-        
-        val shouldUpdate = when {
-            excursionStateChanged -> true
-            isExcursionActive && (now - lastNotificationUpdateTime >= 5_000L) -> true
-            !isExcursionActive && (now - lastNotificationUpdateTime >= 60_000L) -> true
-            else -> false
-        }
-
-        if (shouldUpdate) {
-            lastNotificationUpdateTime = now
-            lastReportedExcursionState = isExcursionActive
-            updateNotification()
-        }
-    }
-
-    private fun finalizeExcursion(duration: Int, peak: Int, settled: Int, points: Double) {
-        persistEngineState(force = true)
-        serviceScope.launch {
-            try {
-                val db = HavenDatabase.getDatabase(this@HavenPacingService)
-                val record = ExcursionRecord(
-                    timestamp = System.currentTimeMillis(),
-                    durationSeconds = duration,
-                    peakHr = peak,
-                    settledHr = settled,
-                    strainPoints = points
-                )
-                db.havenDao().insert(record)
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-        }
-    }
-
-    private fun check0400Rollover() {
-        val now = Calendar.getInstance()
-        val currentDay = now.get(Calendar.DAY_OF_YEAR)
-        val hour = now.get(Calendar.HOUR_OF_DAY)
-
-        if (hour >= 4 && currentDay != lastRolloverDay) {
-            lastRolloverDay = currentDay
-            dailyTotalPoints = 0.0
-            serviceLatchedPeakHr = 0
-            persistEngineState(force = true)
-        }
-    }
-
-    private fun broadcastTelemetry() {
-        val intent = Intent(ACTION_HUD_UPDATE).apply {
-            putExtra(EXTRA_HR, currentHr)
-            putExtra(EXTRA_EXCURSION_SEC, excursionDurationSec)
-            putExtra(EXTRA_PEAK_HR, serviceLatchedPeakHr)
-            putExtra(EXTRA_DAILY_POINTS, dailyTotalPoints)
-            putExtra(EXTRA_DAILY_TOTAL_SEC, (dailyTotalPoints * 60).toInt())
-            putExtra(EXTRA_BUDGET_POINTS, dailyBudgetPoints)
-            putExtra(EXTRA_BUDGET_SEC, (dailyBudgetPoints * 60).toInt())
-            putExtra(EXTRA_EXCURSION_POINTS, currentExcursionPoints)
-            putExtra(EXTRA_STABILITY_SCORE, stabilityScore)
-            putExtra(EXTRA_ACTIVE_CEILING, activeCeiling)
-            putExtra(EXTRA_MODE, "COCKPIT_LIVE")
-            putExtra(EXTRA_BLE_STATUS, bleStatusMessage)
-        }
-        sendBroadcast(intent)
-        onTelemetryUpdate?.invoke(currentHr, excursionDurationSec, (dailyTotalPoints * 60).toInt(), "COCKPIT_LIVE")
-    }
-
-    private fun startBleConnectionFlow() {
-        if (bluetoothAdapter == null || !bluetoothAdapter!!.isEnabled) {
-            bleStatusMessage = "BLE: BLUETOOTH OFF"
-            return
-        }
-
-        // Fast Path: Direct hardware connect if we already know this Garmin's MAC
-        val savedMac = cachedGarminMac ?: prefs.getString(KEY_CACHED_MAC, null)
-        if (!savedMac.isNullOrEmpty()) {
-            try {
-                val device = bluetoothAdapter?.getRemoteDevice(savedMac)
-                if (device != null) {
-                    bleStatusMessage = "BLE: RE-LATCHING..."
-                    bluetoothGatt = device.connectGatt(this, true, gattCallback)
-                    return
-                }
-            } catch (e: Exception) {
-                // Fall back to scanning if direct connect fails
-            }
-        }
-
-        startBleScan()
-    }
-
-    private fun startBleScan() {
-        val scanner = bluetoothAdapter?.bluetoothLeScanner
-        if (scanner == null) {
-            bleStatusMessage = "BLE: SCANNER UNAVAILABLE"
-            return
-        }
-
-        val filter = ScanFilter.Builder()
-            .setServiceUuid(ParcelUuid(UUID_HR_SERVICE))
-            .build()
-        val settings = ScanSettings.Builder()
-            .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
-            .build()
-
-        bleStatusMessage = "BLE: SEARCHING..."
-        isScanning = true
         try {
-            scanner.startScan(listOf(filter), settings, scanCallback)
+            val device = adapter.getRemoteDevice(deviceAddress)
+            bluetoothGatt = device.connectGatt(this, false, gattCallback)
         } catch (e: SecurityException) {
-            bleStatusMessage = "BLE: PERMISSION MISSING"
+            // Log or handle missing BLUETOOTH_CONNECT permission
         }
     }
 
-    private val scanCallback = object : ScanCallback() {
-        override fun onScanResult(callbackType: Int, result: ScanResult?) {
-            result?.device?.let { device ->
-                if (isScanning) {
-                    try {
-                        bluetoothAdapter?.bluetoothLeScanner?.stopScan(this)
-                    } catch (e: SecurityException) {}
-                    isScanning = false
-                }
-                cacheDeviceMac(device.address)
-                connectToDevice(device)
-            }
-        }
-
-        override fun onScanFailed(errorCode: Int) {
-            bleStatusMessage = "BLE: SCAN FAILED ($errorCode)"
-            isScanning = false
-        }
-    }
-
-    private fun cacheDeviceMac(address: String) {
-        cachedGarminMac = address
-        prefs.edit().putString(KEY_CACHED_MAC, address).apply()
-    }
-
-    private fun connectToDevice(device: BluetoothDevice) {
-        bleStatusMessage = "BLE: CONNECTING..."
+    private fun disconnectGatt() {
         try {
-            bluetoothGatt = device.connectGatt(this, true, gattCallback)
+            bluetoothGatt?.disconnect()
+            bluetoothGatt?.close()
+            bluetoothGatt = null
         } catch (e: SecurityException) {
-            bleStatusMessage = "BLE: SECURITY ERROR"
+            // Handled
         }
     }
 
     private val gattCallback = object : BluetoothGattCallback() {
-        override fun onConnectionStateChange(gatt: BluetoothGatt?, status: Int, newState: Int) {
+        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                bleStatusMessage = "BLE: CONNECTED - DISCOVERING"
-                gatt?.device?.address?.let { cacheDeviceMac(it) }
+                isConnected = true
                 try {
-                    gatt?.discoverServices()
-                } catch (e: SecurityException) {}
+                    gatt.discoverServices()
+                } catch (e: SecurityException) { }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                bleStatusMessage = "BLE: SEARCHING..."
+                isConnected = false
                 currentHr = 0
-                gatt?.close()
-                bluetoothGatt = null
-                mainHandler.postDelayed({
-                    startBleConnectionFlow()
-                }, 2000)
+                broadcastTelemetryUpdate()
             }
-            updateNotification()
         }
 
-        override fun onServicesDiscovered(gatt: BluetoothGatt?, status: Int) {
+        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
             if (status == BluetoothGatt.GATT_SUCCESS) {
-                val service = gatt?.getService(UUID_HR_SERVICE)
-                val characteristic = service?.getCharacteristic(UUID_HR_CHARACTERISTIC)
-                if (characteristic != null) {
-                    try {
-                        gatt.setCharacteristicNotification(characteristic, true)
-                        val descriptor = characteristic.getDescriptor(UUID_CLIENT_CONFIG)
-                        if (descriptor != null) {
-                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                                gatt.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-                            } else {
-                                @Suppress("DEPRECATION")
-                                descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                                @Suppress("DEPRECATION")
-                                gatt.writeDescriptor(descriptor)
-                            }
-                            bleStatusMessage = "BLE: LOCKED"
-                            updateNotification()
-                        }
-                    } catch (e: SecurityException) {}
-                }
+                enableHeartRateNotifications(gatt)
             }
         }
 
-        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
-            parseHeartRate(value)
+        @Deprecated("Used for Android 12 and below compatibility")
+        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
+            if (characteristic.uuid == UUID_HEART_RATE_MEASUREMENT) {
+                parseHeartRatePacket(characteristic)
+            }
         }
 
-        @Deprecated("Deprecated in Java")
-        override fun onCharacteristicChanged(gatt: BluetoothGatt?, characteristic: BluetoothGattCharacteristic?) {
-            @Suppress("DEPRECATION")
-            characteristic?.value?.let { parseHeartRate(it) }
+        override fun onCharacteristicChanged(
+            gatt: BluetoothGatt,
+            characteristic: BluetoothGattCharacteristic,
+            value: ByteArray
+        ) {
+            if (characteristic.uuid == UUID_HEART_RATE_MEASUREMENT) {
+                parseHeartRatePacket(characteristic, value)
+            }
         }
     }
 
-    private fun parseHeartRate(data: ByteArray) {
-        if (data.isEmpty()) return
-        val flag = data[0].toInt()
-        val format16 = (flag and 0x01) != 0
-        val hr = if (format16 && data.size >= 3) {
-            (data[1].toInt() and 0xFF) or ((data[2].toInt() and 0xFF) shl 8)
-        } else if (data.size >= 2) {
-            data[1].toInt() and 0xFF
+    private fun enableHeartRateNotifications(gatt: BluetoothGatt) {
+        val service = gatt.getService(UUID_HEART_RATE_SERVICE) ?: return
+        val characteristic = service.getCharacteristic(UUID_HEART_RATE_MEASUREMENT) ?: return
+
+        try {
+            gatt.setCharacteristicNotification(characteristic, true)
+            val descriptor = characteristic.getDescriptor(UUID_CLIENT_CHARACTERISTIC_CONFIG)
+            descriptor?.let {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    gatt.writeDescriptor(it, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
+                } else {
+                    @Suppress("DEPRECATION")
+                    it.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
+                    @Suppress("DEPRECATION")
+                    gatt.writeDescriptor(it)
+                }
+            }
+        } catch (e: SecurityException) { }
+    }
+
+    private fun parseHeartRatePacket(characteristic: BluetoothGattCharacteristic, rawValue: ByteArray? = null) {
+        val flags = if (rawValue != null) rawValue[0].toInt() else characteristic.getIntValue(BluetoothGattCharacteristic.FORMAT_UINT8, 0)
+        val is16Bit = (flags and 0x01) != 0
+
+        val heartRate = if (rawValue != null) {
+            if (is16Bit) {
+                ((rawValue[2].toInt() and 0xFF) shl 8) or (rawValue[1].toInt() and 0xFF)
+            } else {
+                rawValue[1].toInt() and 0xFF
+            }
         } else {
-            0
+            val format = if (is16Bit) BluetoothGattCharacteristic.FORMAT_UINT16 else BluetoothGattCharacteristic.FORMAT_UINT8
+            characteristic.getIntValue(format, 1) ?: return
         }
-        if (hr > 0) {
-            currentHr = hr
+
+        processHeartRate(heartRate)
+    }
+
+    // --- Mathematical Pacing Engine ---
+
+    @Synchronized
+    private fun processHeartRate(hr: Int) {
+        evaluateDailyRollover()
+
+        currentHr = hr
+        if (hr > dailyPeakHr) {
+            dailyPeakHr = hr
         }
+
+        val nowElapsed = SystemClock.elapsedRealtime()
+        val deltaSeconds = if (lastTickTimestampMs == 0L) 1.0 else (nowElapsed - lastTickTimestampMs) / 1000.0
+        lastTickTimestampMs = nowElapsed
+
+        // Excursion boundary monitoring
+        if (hr >= activeCeilingBpm) {
+            if (!isExcursionActive) {
+                isExcursionActive = true
+                excursionStartElapsedMs = nowElapsed
+            }
+            val excursionDurationMs = nowElapsed - excursionStartElapsedMs
+            lastExcursionDurationSeconds = excursionDurationMs / 1000L
+
+            // Only deduct strain points if the 120s (or 60s) grace buffer has lapsed
+            if (excursionDurationMs > graceBufferDurationMs) {
+                val strainRatePerMinute = calculatePiecewiseStrainRate(hr)
+                val burn = (strainRatePerMinute / 60.0) * currentPostureMultiplier * deltaSeconds
+                dailyBudgetRemaining -= burn
+                persistActiveBudget()
+
+                checkVoiceWarningTrigger(nowElapsed, excursionDurationMs)
+            }
+        } else {
+            if (isExcursionActive) {
+                // Recovered below ceiling
+                isExcursionActive = false
+                lastExcursionDurationSeconds = (nowElapsed - excursionStartElapsedMs) / 1000L
+            }
+        }
+
+        updateNotification()
+        broadcastTelemetryUpdate()
+    }
+
+    private fun calculatePiecewiseStrainRate(hr: Int): Double {
+        return when {
+            hr < 89 -> 0.00
+            hr in 89..95 -> 0.12
+            hr in 96..105 -> 0.45
+            hr in 106..114 -> 1.20
+            else -> 2.40 // >= 115 BPM
+        }
+    }
+
+    // --- Auditory Warning Engine (Stream & Focus Routing) ---
+
+    private fun initTextToSpeech() {
+        tts = TextToSpeech(this, this)
+    }
+
+    override fun onInit(status: Int) {
+        if (status == TextToSpeech.SUCCESS) {
+            tts?.language = Locale.US
+
+            // USAGE_ASSISTANCE_NAVIGATION_GUIDANCE bypasses notification channel mutes
+            val audioAttributes = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build()
+
+            tts?.setAudioAttributes(audioAttributes)
+            ttsInitialized = true
+        }
+    }
+
+    private fun checkVoiceWarningTrigger(nowElapsed: Long, excursionDurationMs: Long) {
+        if (!ttsInitialized) return
+
+        // Throttle auditory alerts to once every 45 seconds during an active breached excursion
+        if (nowElapsed - lastSpokenAlertElapsedMs > 45_000L) {
+            lastSpokenAlertElapsedMs = nowElapsed
+            val secondsOver = excursionDurationMs / 1000L
+            val spokenMessage = if (dailyBudgetRemaining <= 0.0) {
+                "Pace ceiling breached. Budget fully exhausted. Terminate exertion and recline immediately."
+            } else {
+                "Ceiling breached. Excursion at $secondsOver seconds. Heart rate $currentHr."
+            }
+            tts?.speak(spokenMessage, TextToSpeech.QUEUE_FLUSH, null, "HAVEN_EXCURSION_ALERT")
+        }
+    }
+
+    // --- Automated HRV Capacity Governor ---
+
+    private fun attemptAutomatedHrvGovernor() {
+        serviceScope.launch {
+            try {
+                val healthConnectClient = HealthConnectClient.getOrCreate(this@HavenPacingService)
+                val now = Instant.now()
+                val twelveHoursAgo = now.minus(12, ChronoUnit.HOURS)
+
+                val request = ReadRecordsRequest(
+                    recordType = HeartRateVariabilityRmssdRecord::class,
+                    timeRangeFilter = TimeRangeFilter.between(twelveHoursAgo, now)
+                )
+
+                val response = healthConnectClient.readRecords(request)
+                val latestRecord = response.records.maxByOrNull { it.time }
+
+                latestRecord?.let {
+                    val rmssd = it.heartRateVariabilityMillis
+                    applyAutomatedHrvGovernor(rmssd)
+                }
+            } catch (e: Exception) {
+                // Health Connect not available, permitted, or no overnight record yet
+            }
+        }
+    }
+
+    private fun applyAutomatedHrvGovernor(rmssd: Double) {
+        morningHrvRmssd = rmssd
+        val ratio = rmssd / BASELINE_HRV_RMSSD
+
+        val dynamicBudget: Float
+        val dynamicCeiling: Int
+        val dynamicGraceSec: Long
+
+        when {
+            ratio >= 1.0 -> {
+                // Optimal recovery / Full tank
+                dynamicBudget = 20.0f
+                dynamicCeiling = 88
+                dynamicGraceSec = 120L
+            }
+            ratio >= 0.80 -> {
+                // Caution / Compromised tank
+                dynamicBudget = 14.0f
+                dynamicCeiling = 84
+                dynamicGraceSec = 60L
+            }
+            else -> {
+                // Suppressed / Malaise Lockdown
+                dynamicBudget = 10.0f
+                dynamicCeiling = 84
+                dynamicGraceSec = 60L
+            }
+        }
+
+        activeCeilingBpm = dynamicCeiling
+        graceBufferDurationMs = dynamicGraceSec * 1000L
+        dailyBudgetRemaining = dynamicBudget.toDouble()
+
+        prefs.edit()
+            .putFloat(KEY_BUDGET_REMAINING, dynamicBudget)
+            .putInt(KEY_ACTIVE_CEILING, dynamicCeiling)
+            .putLong(KEY_GRACE_SEC, dynamicGraceSec)
+            .putFloat(KEY_MORNING_HRV, rmssd.toFloat())
+            .apply()
+
+        broadcastTelemetryUpdate()
+        updateNotification()
+    }
+
+    // --- State Persistence & 04:00 AM Rollover ---
+
+    private fun evaluateDailyRollover() {
+        val currentPacingDate = getCurrentPacingDayStamp()
+        val savedPacingDate = prefs.getString(KEY_POINTS_DATE, "")
+
+        if (savedPacingDate != currentPacingDate) {
+            // 04:00 AM Boundary crossed: wipe accumulators and restore clean baseline
+            dailyBudgetRemaining = BASE_DAILY_BUDGET
+            dailyPeakHr = currentHr
+            lastExcursionDurationSeconds = 0L
+            isExcursionActive = false
+
+            prefs.edit()
+                .putString(KEY_POINTS_DATE, currentPacingDate)
+                .putFloat(KEY_BUDGET_REMAINING, BASE_DAILY_BUDGET.toFloat())
+                .apply()
+
+            // Check for new sleep HRV session
+            attemptAutomatedHrvGovernor()
+        } else {
+            // Same day: load persisted budget float
+            dailyBudgetRemaining = prefs.getFloat(KEY_BUDGET_REMAINING, BASE_DAILY_BUDGET.toFloat()).toDouble()
+            activeCeilingBpm = prefs.getInt(KEY_ACTIVE_CEILING, DEFAULT_CEILING_BPM)
+            graceBufferDurationMs = prefs.getLong(KEY_GRACE_SEC, DEFAULT_GRACE_BUFFER_MS / 1000L) * 1000L
+            morningHrvRmssd = prefs.getFloat(KEY_MORNING_HRV, 0.0f).toDouble()
+        }
+    }
+
+    private fun getCurrentPacingDayStamp(): String {
+        val cal = Calendar.getInstance()
+        // If before 04:00 AM, this time window belongs to the previous day's budget
+        if (cal.get(Calendar.HOUR_OF_DAY) < 4) {
+            cal.add(Calendar.DAY_OF_YEAR, -1)
+        }
+        val sdf = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+        return sdf.format(cal.time)
+    }
+
+    private fun persistActiveBudget() {
+        prefs.edit()
+            .putFloat(KEY_BUDGET_REMAINING, dailyBudgetRemaining.toFloat())
+            .apply()
+    }
+
+    // --- UI Synchronization & Foreground Service Notification ---
+
+    private fun broadcastTelemetryUpdate() {
+        val intent = Intent(ACTION_TELEMETRY_UPDATE).apply {
+            putExtra(EXTRA_CURRENT_HR, currentHr)
+            putExtra(EXTRA_PEAK_HR, dailyPeakHr)
+            putExtra(EXTRA_BUDGET_REMAINING, dailyBudgetRemaining)
+            putExtra(EXTRA_CEILING_BPM, activeCeilingBpm)
+            putExtra(EXTRA_LAST_EXCURSION_SEC, lastExcursionDurationSeconds)
+            putExtra(EXTRA_IS_EXCURSION_ACTIVE, isExcursionActive)
+            putExtra(EXTRA_MORNING_HRV, morningHrvRmssd)
+            setPackage(packageName)
+        }
+        sendBroadcast(intent)
     }
 
     private fun createNotificationChannel() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID,
-                "HAVEN Pacing Telemetry",
+                "HAVEN Flight Deck Live Telemetry",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Live Autonomic Pacing Engine Status"
+                description = "Monitors autonomic strain, excursion buffers, and real-time pacing budgets."
                 setShowBadge(false)
             }
             val manager = getSystemService(NotificationManager::class.java)
-            manager.createNotificationChannel(channel)
+            manager?.createNotificationChannel(channel)
         }
     }
 
-    private fun buildNotification(text: String): Notification {
-        val launchIntent = Intent(this, MainActivity::class.java)
+    private fun buildForegroundNotification(contentText: String): Notification {
+        val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
         val pendingIntent = PendingIntent.getActivity(
-            this, 0, launchIntent,
+            this,
+            0,
+            launchIntent,
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
+
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("HAVEN Flight Deck Active")
-            .setContentText(text)
+            .setContentTitle("HAVEN AUTONOMIC FLIGHT DECK")
+            .setContentText(contentText)
             .setSmallIcon(android.R.drawable.stat_notify_sync)
-            .setContentIntent(pendingIntent)
             .setOngoing(true)
-            .setSilent(true)
+            .setContentIntent(pendingIntent)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+            .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .build()
     }
 
     private fun updateNotification() {
-        val statusText = if (currentHr > 0) {
-            if (isExcursionActive) {
-                String.format("EXCURSION: %d BPM (Peak %d) | Points: %.1f", currentHr, excursionPeakHr, dailyTotalPoints)
-            } else {
-                String.format("HR: %d BPM | Budget: %.1f / %.0f PTS", currentHr, dailyTotalPoints, dailyBudgetPoints)
-            }
+        val statusText = if (isExcursionActive) {
+            "EXCURSION: $currentHr BPM (Ceil: $activeCeilingBpm) | REMAIN: ${String.format(Locale.US, "%.1f", dailyBudgetRemaining)} PTS"
         } else {
-            bleStatusMessage
+            "PULSE: $currentHr BPM | PEAK: $dailyPeakHr | REMAIN: ${String.format(Locale.US, "%.1f", dailyBudgetRemaining)} PTS"
         }
-        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        manager.notify(NOTIFICATION_ID, buildNotification(statusText))
+        val notification = buildForegroundNotification(statusText)
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager
+        manager?.notify(NOTIFICATION_ID, notification)
     }
 
-    override fun onDestroy() {
-        isServiceRunning = false
-        persistEngineState(force = true)
-        tickerRunnable?.let { mainHandler.removeCallbacks(it) }
-        serviceScope.cancel()
-        try {
-            bluetoothGatt?.close()
-            bluetoothGatt = null
-        } catch (e: SecurityException) {}
-        tts?.stop()
-        tts?.shutdown()
-        super.onDestroy()
+    companion object {
+        const val CHANNEL_ID = "haven_telemetry_channel"
+        const val NOTIFICATION_ID = 1042
+
+        // Standard Defaults
+        const val BASE_DAILY_BUDGET = 20.0
+        const val DEFAULT_CEILING_BPM = 88
+        const val DEFAULT_GRACE_BUFFER_MS = 120_000L
+        const val BASELINE_HRV_RMSSD = 50.0
+
+        // Storage Keys
+        const val KEY_BUDGET_REMAINING = "budget_remaining"
+        const val KEY_POINTS_DATE = "points_date_stamp"
+        const val KEY_MORNING_HRV = "morning_hrv_rmssd"
+        const val KEY_ACTIVE_CEILING = "active_ceiling_bpm"
+        const val KEY_GRACE_SEC = "grace_buffer_sec"
+
+        // Broadcast Action & Extras
+        const val ACTION_TELEMETRY_UPDATE = "com.haven.autonomic.ACTION_TELEMETRY_UPDATE"
+        const val EXTRA_CURRENT_HR = "extra_current_hr"
+        const val EXTRA_PEAK_HR = "extra_peak_hr"
+        const val EXTRA_BUDGET_REMAINING = "extra_budget_remaining"
+        const val EXTRA_CEILING_BPM = "extra_ceiling_bpm"
+        const val EXTRA_LAST_EXCURSION_SEC = "extra_last_excursion_sec"
+        const val EXTRA_IS_EXCURSION_ACTIVE = "extra_is_excursion_active"
+        const val EXTRA_MORNING_HRV = "extra_morning_hrv"
+
+        // Service Inbound Extras
+        const val EXTRA_DEVICE_ADDRESS = "extra_device_address"
+        const val EXTRA_POSTURE_MULTIPLIER = "extra_posture_multiplier"
+
+        // Bluetooth Standard UUIDs
+        val UUID_HEART_RATE_SERVICE: UUID = UUID.fromString("0000180d-0000-1000-8000-00805f9b34fb")
+        val UUID_HEART_RATE_MEASUREMENT: UUID = UUID.fromString("00002a37-0000-1000-8000-00805f9b34fb")
+        val UUID_CLIENT_CHARACTERISTIC_CONFIG: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
     }
 }
