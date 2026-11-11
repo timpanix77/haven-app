@@ -85,7 +85,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         super.onDestroy()
     }
 
-    // --- Audio Focus Ducker Engine ---
+    // --- Audio Focus Ducker & British TTS Engine ---
 
     private fun initTts() {
         tts = TextToSpeech(this, this)
@@ -93,7 +93,21 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
 
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
-            tts?.language = Locale.US
+            // Restore British voice locale
+            tts?.language = Locale.UK
+
+            // Prefer British English female voice if installed on device
+            try {
+                val britishVoices = tts?.voices?.filter { 
+                    it.locale.language == Locale.UK.language && it.locale.country == Locale.UK.country 
+                }
+                val femaleVoice = britishVoices?.firstOrNull { it.name.lowercase().contains("female") }
+                    ?: britishVoices?.firstOrNull()
+                if (femaleVoice != null) {
+                    tts?.voice = femaleVoice
+                }
+            } catch (_: Exception) { }
+
             tts?.setAudioAttributes(
                 AudioAttributes.Builder()
                     .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
