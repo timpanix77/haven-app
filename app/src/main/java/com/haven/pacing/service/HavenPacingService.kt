@@ -320,7 +320,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
                     val msg = if (remaining <= 0.0) {
                         "Budget exhausted. Recline immediately."
                     } else {
-                        "Ceiling breached. Heart rate $currentHr."
+                        "Heart rate $currentHr."
                     }
                     speakAlert(msg)
                 }
