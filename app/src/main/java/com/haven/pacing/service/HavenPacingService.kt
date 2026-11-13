@@ -93,18 +93,12 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
 
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
-            tts?.language = Locale.UK
-
-            try {
-                val britishVoices = tts?.voices?.filter {
-                    it.locale.language == Locale.UK.language && it.locale.country == Locale.UK.country
-                }
-                val femaleVoice = britishVoices?.firstOrNull { it.name.lowercase().contains("female") }
-                    ?: britishVoices?.firstOrNull()
-                if (femaleVoice != null) {
-                    tts?.voice = femaleVoice
-                }
-            } catch (_: Exception) { }
+            val sysVoice = tts?.defaultVoice
+            if (sysVoice != null && sysVoice.locale.language == Locale.UK.language && sysVoice.locale.country == Locale.UK.country) {
+                tts?.voice = sysVoice
+            } else {
+                tts?.language = Locale.UK
+            }
 
             tts?.setAudioAttributes(
                 AudioAttributes.Builder()
