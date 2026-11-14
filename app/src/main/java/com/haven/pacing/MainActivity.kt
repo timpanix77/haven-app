@@ -64,8 +64,6 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var vaultManager: VaultManager
     private var lastRecordedExcursionSec: Int = 0
-
-    // Indefinite Latched Peak Memory for POTS visual anchoring
     private var latchedPeakHr: Int = 0
     private var currentSurgePeakHr: Int = 0
 
@@ -77,11 +75,12 @@ class MainActivity : AppCompatActivity() {
     private val requestHealthPermissions = registerForActivityResult(
         PermissionController.createRequestPermissionResultContract()
     ) { granted ->
-        if (granted.containsAll(healthPermissions)) {
-            Toast.makeText(this, "Health Connect Linked! Exporting 30-Day Vault...", Toast.LENGTH_SHORT).show()
+        val msg = if (granted.containsAll(healthPermissions)) {
+            "Health Connect Linked! Exporting 30-Day Vault..."
         } else {
-            Toast.makeText(this, "Health Connect Access Skipped — Exporting Excursions...", Toast.LENGTH_SHORT).show()
+            "Health Connect Skipped — Exporting Excursions..."
         }
+        Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
         runFullVaultExport()
     }
 
@@ -89,9 +88,7 @@ class MainActivity : AppCompatActivity() {
         ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
         if (uri != null) {
-            lifecycleScope.launch(Dispatchers.IO) {
-                restoreFromUriWithFallback(uri)
-            }
+            lifecycleScope.launch(Dispatchers.IO) { restoreFromUriWithFallback(uri) }
         } else {
             Toast.makeText(this, "Restore Cancelled", Toast.LENGTH_SHORT).show()
         }
@@ -126,19 +123,14 @@ class MainActivity : AppCompatActivity() {
     private val hudReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == HavenPacingService.ACTION_HUD_UPDATE) {
-                val servicePeak = intent.getIntExtra(HavenPacingService.EXTRA_PEAK_HR, 0)
-                val dailyPoints = intent.getDoubleExtra(HavenPacingService.EXTRA_DAILY_POINTS, 0.0)
-                val budgetPoints = intent.getDoubleExtra(HavenPacingService.EXTRA_BUDGET_POINTS, 20.0)
-                val excPoints = intent.getDoubleExtra(HavenPacingService.EXTRA_EXCURSION_POINTS, 0.0)
-
                 renderTelemetry(
                     intent.getIntExtra(HavenPacingService.EXTRA_HR, 0),
                     intent.getIntExtra(HavenPacingService.EXTRA_EXCURSION_SEC, 0),
                     intent.getBooleanExtra(HavenPacingService.EXTRA_IN_EXCURSION, false),
-                    servicePeak,
-                    dailyPoints,
-                    budgetPoints,
-                    excPoints,
+                    intent.getIntExtra(HavenPacingService.EXTRA_PEAK_HR, 0),
+                    intent.getDoubleExtra(HavenPacingService.EXTRA_DAILY_POINTS, 0.0),
+                    intent.getDoubleExtra(HavenPacingService.EXTRA_BUDGET_POINTS, 20.0),
+                    intent.getDoubleExtra(HavenPacingService.EXTRA_EXCURSION_POINTS, 0.0),
                     intent.getIntExtra(HavenPacingService.EXTRA_STABILITY_SCORE, 75),
                     intent.getIntExtra(HavenPacingService.EXTRA_ACTIVE_CEILING, 88),
                     intent.getIntExtra(HavenPacingService.EXTRA_GRACE_SEC, 120),
@@ -186,8 +178,7 @@ class MainActivity : AppCompatActivity() {
             lifecycleScope.launch(Dispatchers.IO) {
                 val needsHealthPrompt = try {
                     val client = HealthConnectClient.getOrCreate(this@MainActivity)
-                    val granted = client.permissionController.getGrantedPermissions()
-                    !granted.containsAll(healthPermissions)
+                    !client.permissionController.getGrantedPermissions().containsAll(healthPermissions)
                 } catch (_: Exception) {
                     false
                 }
@@ -206,7 +197,6 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Long-press EXPORT VAULT to pick a different Google Drive folder anytime
         btnExport.setOnLongClickListener {
             lifecycleScope.launch(Dispatchers.IO) {
                 vaultManager.exportVault(this@MainActivity)
@@ -245,13 +235,11 @@ class MainActivity : AppCompatActivity() {
     private fun runFullVaultExport() {
         lifecycleScope.launch(Dispatchers.IO) {
             vaultManager.exportVault(this@MainActivity)
-
             val savedUriStr = getSharedPreferences(HavenPacingService.PREFS_NAME, Context.MODE_PRIVATE)
                 .getString(KEY_DRIVE_EXPORT_URI, null)
 
             if (!savedUriStr.isNullOrEmpty()) {
-                val uri = Uri.parse(savedUriStr)
-                val synced = writeLatestExportToUri(uri)
+                val synced = writeLatestExportToUri(Uri.parse(savedUriStr))
                 withContext(Dispatchers.Main) {
                     if (synced) {
                         Toast.makeText(this@MainActivity, "30-Day Vault Exported to Google Drive!", Toast.LENGTH_SHORT).show()
@@ -272,11 +260,7 @@ class MainActivity : AppCompatActivity() {
 
     private suspend fun buildEnrichedVaultBytes(): ByteArray {
         val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-        val candidates = listOf(
-            "haven_vault_export.json",
-            "haven_vault_backup.json",
-            "haven_vault.json"
-        )
+        val candidates = listOf("haven_vault_export.json", "haven_vault_backup.json", "haven_vault.json")
         var sourceFile: File? = null
         if (downloadsDir != null && downloadsDir.exists()) {
             for (name in candidates) {
@@ -319,7 +303,6 @@ class MainActivity : AppCompatActivity() {
             val now = Instant.now()
             val start = now.minus(30, ChronoUnit.DAYS)
 
-            // 1. Pull 30 days of overnight HRV (rMSSD)
             try {
                 val hrvRes = client.readRecords(
                     ReadRecordsRequest(
@@ -330,13 +313,11 @@ class MainActivity : AppCompatActivity() {
                 for (rec in hrvRes.records) {
                     val key = instantToDayKey(rec.time)
                     val entry = dailyBioObj.optJSONObject(key) ?: JSONObject()
-                    val rounded = Math.round(rec.heartRateVariabilityMillis * 10.0) / 10.0
-                    entry.put("hrv", rounded)
+                    entry.put("hrv", Math.round(rec.heartRateVariabilityMillis * 10.0) / 10.0)
                     dailyBioObj.put(key, entry)
                 }
             } catch (_: Exception) { }
 
-            // 2. Pull 30 days of Resting Heart Rate
             try {
                 val rhrRes = client.readRecords(
                     ReadRecordsRequest(
@@ -376,11 +357,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private suspend fun tryAutoRestoreFromDownloads(): Int {
-        val candidates = listOf(
-            "haven_vault_export.json",
-            "haven_vault_backup.json",
-            "haven_vault.json"
-        )
+        val candidates = listOf("haven_vault_export.json", "haven_vault_backup.json", "haven_vault.json")
         val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
         if (downloadsDir != null && downloadsDir.exists()) {
             for (name in candidates) {
@@ -397,11 +374,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private suspend fun restoreFromUriWithFallback(uri: Uri) {
-        var count = -1
-        try {
-            count = vaultManager.restoreVaultFromUri(this@MainActivity, uri)
+        val count = try {
+            vaultManager.restoreVaultFromUri(this@MainActivity, uri)
         } catch (_: Exception) {
-            count = -1
+            -1
         }
 
         if (count >= 0) {
@@ -412,17 +388,12 @@ class MainActivity : AppCompatActivity() {
         }
 
         try {
-            val jsonText = contentResolver.openInputStream(uri)?.use { stream ->
-                stream.bufferedReader().readText()
-            }
+            val jsonText = contentResolver.openInputStream(uri)?.use { it.bufferedReader().readText() }
             if (!jsonText.isNullOrEmpty()) {
                 val fallbackCount = parseAndInsertExcursions(jsonText)
                 withContext(Dispatchers.Main) {
-                    if (fallbackCount >= 0) {
-                        Toast.makeText(this@MainActivity, "Restored $fallbackCount Excursions!", Toast.LENGTH_SHORT).show()
-                    } else {
-                        Toast.makeText(this@MainActivity, "Restore Failed: Empty or invalid vault", Toast.LENGTH_LONG).show()
-                    }
+                    val msg = if (fallbackCount >= 0) "Restored $fallbackCount Excursions!" else "Restore Failed: Empty or invalid vault"
+                    Toast.makeText(this@MainActivity, msg, Toast.LENGTH_LONG).show()
                 }
             } else {
                 withContext(Dispatchers.Main) {
@@ -430,4 +401,278 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         } catch (e: Exception) {
-            withContext(Dispatchers
+            withContext(Dispatchers.Main) {
+                Toast.makeText(this@MainActivity, "Restore Error: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    private suspend fun parseAndInsertExcursions(jsonString: String): Int {
+        val trimmed = jsonString.trim()
+        val jsonArray = if (trimmed.startsWith("[")) {
+            JSONArray(trimmed)
+        } else {
+            val obj = JSONObject(trimmed)
+            when {
+                obj.has("records") -> obj.getJSONArray("records")
+                obj.has("excursions") -> obj.getJSONArray("excursions")
+                obj.has("data") -> obj.getJSONArray("data")
+                else -> {
+                    var found: JSONArray? = null
+                    val keys = obj.keys()
+                    while (keys.hasNext()) {
+                        val v = obj.optJSONArray(keys.next())
+                        if (v != null) {
+                            found = v
+                            break
+                        }
+                    }
+                    found ?: return -1
+                }
+            }
+        }
+
+        val db = HavenDatabase.getDatabase(this@MainActivity)
+        var count = 0
+        for (i in 0 until jsonArray.length()) {
+            val item = jsonArray.getJSONObject(i)
+            val record = ExcursionRecord(
+                timestamp = item.optLong("timestamp", item.optLong("time", System.currentTimeMillis())),
+                durationSeconds = item.optInt("durationSeconds", item.optInt("duration", 0)),
+                peakHr = item.optInt("peakHr", item.optInt("peak", 0)),
+                settledHr = item.optInt("settledHr", item.optInt("settled", 0)),
+                strainPoints = item.optDouble("strainPoints", item.optDouble("points", 0.0))
+            )
+            db.havenDao().insert(record)
+            count++
+        }
+        return count
+    }
+
+    override fun onResume() {
+        super.onResume()
+        val filter = IntentFilter(HavenPacingService.ACTION_HUD_UPDATE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(hudReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(hudReceiver, filter)
+        }
+
+        if (HavenPacingService.isServiceRunning) {
+            btnArm.text = "ENGINE ACTIVE (ARMED)"
+            btnArm.setTextColor(Color.parseColor("#00E676"))
+            try {
+                startService(Intent(this, HavenPacingService::class.java))
+            } catch (_: Exception) { }
+        } else {
+            btnArm.text = "START PACING ENGINE"
+            btnArm.setTextColor(Color.WHITE)
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        try {
+            unregisterReceiver(hudReceiver)
+        } catch (_: Exception) { }
+    }
+
+    private fun renderTelemetry(
+        hr: Int,
+        excSec: Int,
+        inExcursion: Boolean,
+        servicePeakHr: Int,
+        dailyPoints: Double,
+        budgetPoints: Double,
+        excPoints: Double,
+        stability: Int,
+        ceiling: Int,
+        graceSec: Int,
+        mode: String,
+        bleStatus: String = ""
+    ) {
+        if (hr > 0) {
+            tvLiveHr.text = hr.toString()
+            vuHr.setLevel((hr - 40).coerceAtLeast(0).toFloat(), 70f)
+            when {
+                hr <= 75 -> {
+                    tvLiveHr.setTextColor(Color.parseColor("#00E676"))
+                    tvHrStatus.text = "BPM / FLOOR: RECOVERED (<=75)"
+                }
+                hr < ceiling -> {
+                    tvLiveHr.setTextColor(Color.WHITE)
+                    tvHrStatus.text = "BPM / SAFE ACTIVE ZONE"
+                }
+                hr < ceiling + 3 -> {
+                    tvLiveHr.setTextColor(Color.parseColor("#FF9100"))
+                    tvHrStatus.text = "BPM / CEILING WARNING"
+                }
+                else -> {
+                    tvLiveHr.setTextColor(Color.parseColor("#FF5252"))
+                    tvHrStatus.text = "BPM / CEILING BREACH (" + ceiling + ")"
+                }
+            }
+        } else {
+            tvLiveHr.text = "--"
+            tvLiveHr.setTextColor(Color.parseColor("#8E8E93"))
+            tvHrStatus.text = if (bleStatus.isNotEmpty()) bleStatus else "BLE: SEARCHING..."
+        }
+
+        if (inExcursion) {
+            if (currentSurgePeakHr == 0 || hr > currentSurgePeakHr) {
+                currentSurgePeakHr = hr
+            }
+            if (currentSurgePeakHr > latchedPeakHr) {
+                latchedPeakHr = currentSurgePeakHr
+            }
+        } else {
+            currentSurgePeakHr = 0
+        }
+
+        if (servicePeakHr >= ceiling && servicePeakHr > latchedPeakHr) {
+            latchedPeakHr = servicePeakHr
+        }
+        if (hr >= ceiling && hr > latchedPeakHr) {
+            latchedPeakHr = hr
+        }
+
+        if (latchedPeakHr > 0) {
+            tvPeakIndicator.text = "PEAK: " + latchedPeakHr + " BPM"
+            tvPeakIndicator.setTextColor(
+                when {
+                    latchedPeakHr >= 115 -> Color.parseColor("#FF1744")
+                    latchedPeakHr >= ceiling -> Color.parseColor("#FF5252")
+                    latchedPeakHr >= 76 -> Color.parseColor("#FFEA00")
+                    else -> Color.parseColor("#00E676")
+                }
+            )
+        } else {
+            tvPeakIndicator.text = "PEAK: --"
+            tvPeakIndicator.setTextColor(Color.parseColor("#8E8E93"))
+        }
+
+        val safeGrace = graceSec.coerceAtLeast(1)
+        if (inExcursion) {
+            lastRecordedExcursionSec = excSec
+            tvExcursion.text = String.format(Locale.US, "%02d:%02d", excSec / 60, excSec % 60)
+            tvExcursion.setTextColor(Color.parseColor("#FF9100"))
+            vuGrace.setLevel(excSec.coerceAtMost(safeGrace).toFloat(), safeGrace.toFloat())
+            val remainingGrace = (safeGrace - excSec).coerceAtLeast(0)
+            if (remainingGrace > 0) {
+                tvBufferStatus.text = "ACTIVE (" + remainingGrace + "s LEFT)"
+                tvBufferStatus.setTextColor(Color.parseColor("#FF9100"))
+            } else {
+                tvBufferStatus.text = "OVERAGE (+" + (excSec - safeGrace) + "s)"
+                tvBufferStatus.setTextColor(Color.parseColor("#FF5252"))
+            }
+        } else {
+            if (excSec > 0) lastRecordedExcursionSec = excSec
+            tvExcursion.text = String.format(Locale.US, "%02d:%02d", lastRecordedExcursionSec / 60, lastRecordedExcursionSec % 60)
+            tvExcursion.setTextColor(Color.WHITE)
+            vuGrace.setLevel(0f, safeGrace.toFloat())
+            tvBufferStatus.text = "STANDBY"
+            tvBufferStatus.setTextColor(Color.parseColor("#8E8E93"))
+        }
+
+        tvBudgetLabel.text = String.format(Locale.US, "PACE POINTS (%.0f CAP)", budgetPoints)
+        vuBudget.setLevel(dailyPoints.toFloat(), budgetPoints.toFloat())
+
+        val remainingPoints = budgetPoints - dailyPoints
+        if (remainingPoints >= 0) {
+            tvBudgetRemaining.text = String.format(Locale.US, "%.1f PTS", remainingPoints)
+            tvBudgetRemaining.setTextColor(Color.parseColor("#00E676"))
+            if (dailyPoints >= budgetPoints * 0.75) {
+                tvPaceStatus.text = "PACE: GUARDED"
+                tvPaceStatus.setTextColor(Color.parseColor("#FF9100"))
+            } else {
+                tvPaceStatus.text = "PACE: ON TRACK"
+                tvPaceStatus.setTextColor(Color.parseColor("#00E676"))
+            }
+        } else {
+            tvBudgetRemaining.text = String.format(Locale.US, "-%.1f PTS", -remainingPoints)
+            tvBudgetRemaining.setTextColor(Color.parseColor("#FF5252"))
+            tvPaceStatus.text = "PACE: OVER BUDGET"
+            tvPaceStatus.setTextColor(Color.parseColor("#FF5252"))
+        }
+
+        val stabilityTier = when {
+            stability >= 85 -> "[OPTIMAL]"
+            stability >= 70 -> "[STABLE]"
+            stability >= 50 -> "[GUARDED]"
+            stability >= 30 -> "[VULNERABLE]"
+            else -> "[VETO / CRASH]"
+        }
+        tvStabilityBanner.text = String.format(Locale.US, "STABILITY: %d/100 %s | CEIL: %d | BUD: %.0f PTS", stability, stabilityTier, ceiling, budgetPoints)
+        tvStabilityBanner.setTextColor(
+            when {
+                stability >= 70 -> Color.parseColor("#00E676")
+                stability >= 50 -> Color.parseColor("#FFEA00")
+                stability >= 30 -> Color.parseColor("#FF9100")
+                else -> Color.parseColor("#FF1744")
+            }
+        )
+
+        if (mode == "COCKPIT_DARK") {
+            tvMode.text = "[ COCKPIT DARK ]"
+            tvMode.setTextColor(Color.parseColor("#757575"))
+        } else {
+            tvMode.text = "[ COCKPIT LIVE ]"
+            tvMode.setTextColor(Color.parseColor("#00E676"))
+        }
+    }
+
+    private fun checkPermissionsAndStartService() {
+        val permissions = mutableListOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            permissions.add(Manifest.permission.BLUETOOTH_SCAN)
+            permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+
+        val missing = permissions.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+
+        if (missing.isNotEmpty()) {
+            Toast.makeText(this, "Requesting OS Permissions...", Toast.LENGTH_SHORT).show()
+            ActivityCompat.requestPermissions(this, missing.toTypedArray(), 101)
+        } else {
+            startHavenService()
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
+            Toast.makeText(this, "Permissions Granted!", Toast.LENGTH_SHORT).show()
+            startHavenService()
+        } else {
+            Toast.makeText(this, "Permission Denied in OS! Enable in App Settings", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun startHavenService() {
+        val serviceIntent = Intent(this, HavenPacingService::class.java)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(serviceIntent)
+            } else {
+                startService(serviceIntent)
+            }
+            btnArm.text = "ENGINE ACTIVE (ARMED)"
+            btnArm.setTextColor(Color.parseColor("#00E676"))
+            Toast.makeText(this, "Haven Engine Starting...", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "Service Start Error: " + e.message, Toast.LENGTH_LONG).show()
+        }
+    }
+
+    companion object {
+        private const val KEY_DRIVE_EXPORT_URI = "drive_export_uri"
+    }
+}
