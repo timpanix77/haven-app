@@ -1,527 +1,612 @@
-package com.haven.pacing.service
+package com.haven.pacing
 
-import android.app.*
-import android.bluetooth.*
-import android.bluetooth.le.*
-import android.content.*
-import android.media.*
-import android.os.*
-import android.speech.tts.*
-import androidx.core.app.NotificationCompat
-import androidx.health.connect.client.HealthConnectClient
-import androidx.health.connect.client.records.HeartRateVariabilityRmssdRecord
-import androidx.health.connect.client.request.ReadRecordsRequest
-import androidx.health.connect.client.time.TimeRangeFilter
-import kotlinx.coroutines.*
-import java.text.SimpleDateFormat
-import java.time.Instant
-import java.time.temporal.ChronoUnit
-import java.util.*
+import android.Manifest
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.content.pm.PackageManager
+import android.graphics.Color
+import android.net.Uri
+import android.os.Build
+import android.os.Bundle
+import android.os.Environment
+import android.widget.Button
+import android.widget.TextView
+import android.widget.Toast
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.appcompat.app.AppCompatActivity
+import androidx.core.app.ActivityCompat
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.lifecycleScope
+import com.haven.pacing.data.ExcursionRecord
+import com.haven.pacing.data.HavenDatabase
+import com.haven.pacing.data.VaultManager
+import com.haven.pacing.service.HavenPacingService
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
+import java.io.File
 
-class HavenPacingService : Service(), TextToSpeech.OnInitListener {
+class MainActivity : AppCompatActivity() {
 
-    private val binder = LocalBinder()
-    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    private lateinit var prefs: SharedPreferences
-    private lateinit var audioManager: AudioManager
-    private var audioFocusRequest: AudioFocusRequest? = null
+    private lateinit var tvLiveHr: TextView
+    private lateinit var tvHrStatus: TextView
+    private lateinit var tvMode: TextView
+    private lateinit var tvExcursion: TextView
+    private lateinit var tvBudgetRemaining: TextView
+    private lateinit var tvBudgetLabel: TextView
+    private lateinit var tvPaceStatus: TextView
+    private lateinit var tvBufferStatus: TextView
+    private lateinit var tvPeakIndicator: TextView
+    private lateinit var tvStabilityBanner: TextView
+    private lateinit var btnArm: Button
+    private lateinit var btnExport: Button
+    private lateinit var btnRestore: Button
 
-    private var tts: TextToSpeech? = null
-    private var ttsReady = false
+    private lateinit var vuHr: LedVuMeterView
+    private lateinit var vuBudget: LedVuMeterView
+    private lateinit var vuGrace: LedVuMeterView
 
-    private var gatt: BluetoothGatt? = null
-    private var isConnected = false
-    private var isScanning = false
+    private lateinit var vaultManager: VaultManager
+    private var lastRecordedExcursionSec: Int = 0
 
-    // Real-Time Autonomic State
-    private var currentHr = 0
-    private var dailyPeakHr = 0
-    private var activeCeiling = DEFAULT_CEILING_BPM
-    private var graceMs = DEFAULT_GRACE_BUFFER_MS
-    private var budgetCap = BASE_DAILY_BUDGET
-    private var dailyBurn = 0.0
-    private var excursionBurn = 0.0
-    private var morningHrv = BASELINE_HRV_RMSSD
-    private var stability = 75
-    private var bleStatus = "BLE: READY"
+    // Indefinite Latched Peak Memory for POTS visual anchoring
+    private var latchedPeakHr: Int = 0
+    private var currentSurgePeakHr: Int = 0
 
-    // Excursion State Tracking
-    private var inExcursion = false
-    private var excursionStartMs = 0L
-    private var excursionDurationSec = 0L
-    private var lastTickMs = 0L
-    private var lastAlertMs = 0L
-
-    inner class LocalBinder : Binder() {
-        fun getService(): HavenPacingService = this@HavenPacingService
-    }
-
-    override fun onCreate() {
-        super.onCreate()
-        isServiceRunning = true
-        prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
-
-        initTts()
-        createNotificationChannel()
-        startForeground(NOTIFICATION_ID, buildNotification("HAVEN Telemetry Initializing..."))
-
-        evaluateRollover()
-        fetchMorningHrv()
-        startBleAutoConnect()
-    }
-
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        evaluateRollover()
-        broadcastHud()
-        return START_STICKY
-    }
-
-    override fun onBind(intent: Intent?): IBinder = binder
-
-    override fun onDestroy() {
-        isServiceRunning = false
-        scope.cancel()
-        stopBle()
-        abandonDucking()
-        tts?.stop()
-        tts?.shutdown()
-        super.onDestroy()
-    }
-
-    // --- Audio Focus Ducker & British TTS Engine ---
-
-    private fun initTts() {
-        tts = TextToSpeech(this, this)
-    }
-
-    override fun onInit(status: Int) {
-        if (status == TextToSpeech.SUCCESS) {
-            val sysVoice = tts?.defaultVoice
-            if (sysVoice != null && sysVoice.locale.language == Locale.UK.language && sysVoice.locale.country == Locale.UK.country) {
-                tts?.voice = sysVoice
-            } else {
-                tts?.language = Locale.UK
-            }
-
-            tts?.setAudioAttributes(
-                AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
-                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                    .build()
-            )
-            tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                override fun onStart(utteranceId: String?) {}
-                override fun onDone(utteranceId: String?) { abandonDucking() }
-                override fun onError(utteranceId: String?) { abandonDucking() }
-            })
-            ttsReady = true
-        }
-    }
-
-    private fun requestDucking() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val attr = AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
-                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                .build()
-            audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
-                .setAudioAttributes(attr)
-                .setAcceptsDelayedFocusGain(false)
-                .setOnAudioFocusChangeListener { }
-                .build()
-            audioFocusRequest?.let { audioManager.requestAudioFocus(it) }
-        } else {
-            @Suppress("DEPRECATION")
-            audioManager.requestAudioFocus(null, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
-        }
-    }
-
-    private fun abandonDucking() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            audioFocusRequest?.let { audioManager.abandonAudioFocusRequest(it) }
-        } else {
-            @Suppress("DEPRECATION")
-            audioManager.abandonAudioFocus(null)
-        }
-    }
-
-    private fun speakAlert(message: String) {
-        if (!ttsReady) return
-        requestDucking()
-        val params = Bundle()
-        params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, "HAVEN_ALERT")
-        tts?.speak(message, TextToSpeech.QUEUE_FLUSH, params, "HAVEN_ALERT")
-    }
-
-    // --- BLE Telemetry Ingress & Auto-Discovery ---
-
-    private fun startBleAutoConnect() {
-        val adapter = (getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter ?: return
-        if (!adapter.isEnabled) return
-
-        val savedAddr = prefs.getString(KEY_SAVED_DEVICE_ADDR, null)
-        if (!savedAddr.isNullOrEmpty()) {
-            connectGatt(savedAddr)
-        } else {
-            scanBle(adapter)
-        }
-    }
-
-    private fun scanBle(adapter: BluetoothAdapter) {
-        val scanner = adapter.bluetoothLeScanner ?: return
-        if (isScanning) return
-
-        val filter = ScanFilter.Builder().setServiceUuid(ParcelUuid(UUID_HR_SERVICE)).build()
-        val settings = ScanSettings.Builder().setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY).build()
-
-        try {
-            isScanning = true
-            bleStatus = "BLE: SEARCHING FOR WATCH..."
-            broadcastHud()
-            scanner.startScan(listOf(filter), settings, scanCallback)
-        } catch (_: SecurityException) {
-            isScanning = false
-        }
-    }
-
-    private val scanCallback = object : ScanCallback() {
-        override fun onScanResult(callbackType: Int, result: ScanResult?) {
-            result?.device?.let { device ->
-                stopScan()
-                connectGatt(device.address)
-            }
-        }
-    }
-
-    private fun stopScan() {
-        if (!isScanning) return
-        val scanner = (getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter?.bluetoothLeScanner
-        try { scanner?.stopScan(scanCallback) } catch (_: SecurityException) { }
-        isScanning = false
-    }
-
-    private fun connectGatt(address: String) {
-        val adapter = (getSystemService(Context.BLUETOOTH_SERVICE) as? BluetoothManager)?.adapter ?: return
-        try {
-            val device = adapter.getRemoteDevice(address)
-            gatt = device.connectGatt(this, false, gattCallback)
-            prefs.edit().putString(KEY_SAVED_DEVICE_ADDR, address).apply()
-            bleStatus = "BLE: CONNECTING..."
-            broadcastHud()
-        } catch (_: SecurityException) { }
-    }
-
-    private fun stopBle() {
-        stopScan()
-        try {
-            gatt?.disconnect()
-            gatt?.close()
-            gatt = null
-        } catch (_: SecurityException) { }
-    }
-
-    private val gattCallback = object : BluetoothGattCallback() {
-        override fun onConnectionStateChange(g: BluetoothGatt, status: Int, newState: Int) {
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
-                isConnected = true
-                bleStatus = "BLE: CONNECTED"
-                broadcastHud()
-                try { g.discoverServices() } catch (_: SecurityException) { }
-            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                isConnected = false
-                currentHr = 0
-                bleStatus = "BLE: DISCONNECTED"
-                broadcastHud()
-                startBleAutoConnect()
-            }
-        }
-
-        override fun onServicesDiscovered(g: BluetoothGatt, status: Int) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                val charac = g.getService(UUID_HR_SERVICE)?.getCharacteristic(UUID_HR_MEASURE) ?: return
-                try {
-                    g.setCharacteristicNotification(charac, true)
-                    val desc = charac.getDescriptor(UUID_CLIENT_CONFIG) ?: return
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        g.writeDescriptor(desc, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-                    } else {
-                        @Suppress("DEPRECATION")
-                        desc.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                        @Suppress("DEPRECATION")
-                        g.writeDescriptor(desc)
-                    }
-                } catch (_: SecurityException) { }
-            }
-        }
-
-        @Deprecated("Android 12 compatibility")
-        override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic) {
-            if (c.uuid == UUID_HR_MEASURE) {
-                val format = if ((c.getIntValue(BluetoothGattCharacteristic.FORMAT_UINT8, 0) and 0x01) != 0) {
-                    BluetoothGattCharacteristic.FORMAT_UINT16
-                } else {
-                    BluetoothGattCharacteristic.FORMAT_UINT8
-                }
-                parseHr(c.getIntValue(format, 1) ?: 0)
-            }
-        }
-
-        override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray) {
-            if (c.uuid == UUID_HR_MEASURE) {
-                val is16 = (value[0].toInt() and 0x01) != 0
-                val hr = if (is16) ((value[2].toInt() and 0xFF) shl 8) or (value[1].toInt() and 0xFF) else value[1].toInt() and 0xFF
-                parseHr(hr)
-            }
-        }
-    }
-
-    // --- Pacing Engine & Math Model ---
-
-    @Synchronized
-    private fun parseHr(hr: Int) {
-        if (hr <= 0) return
-        evaluateRollover()
-
-        currentHr = hr
-        if (hr > dailyPeakHr) {
-            dailyPeakHr = hr
-            prefs.edit().putInt(KEY_DAILY_PEAK_HR, dailyPeakHr).apply()
-        }
-
-        val now = SystemClock.elapsedRealtime()
-        val deltaSec = if (lastTickMs == 0L) 1.0 else (now - lastTickMs) / 1000.0
-        lastTickMs = now
-
-        if (hr >= activeCeiling) {
-            if (!inExcursion) {
-                inExcursion = true
-                excursionStartMs = now
-                excursionBurn = 0.0
-            }
-            val durMs = now - excursionStartMs
-            excursionDurationSec = durMs / 1000L
-            prefs.edit().putLong(KEY_LAST_EXCURSION_SEC, excursionDurationSec).apply()
-
-            if (durMs > graceMs) {
-                val rate = when {
-                    hr < 89 -> 0.0
-                    hr in 89..95 -> 0.12
-                    hr in 96..105 -> 0.45
-                    hr in 106..114 -> 1.20
-                    else -> 2.40
-                }
-                val pts = (rate / 60.0) * deltaSec
-                dailyBurn += pts
-                excursionBurn += pts
-                prefs.edit().putFloat(KEY_DAILY_BURN, dailyBurn.toFloat()).apply()
-
-                if (now - lastAlertMs > 45_000L) {
-                    lastAlertMs = now
-                    val remaining = budgetCap - dailyBurn
-                    val msg = if (remaining <= 0.0) {
-                        "Budget exhausted. Recline immediately."
-                    } else {
-                        "Heart rate $currentHr."
-                    }
-                    speakAlert(msg)
-                }
+    private val restoreFileLauncher = registerForActivityResult(
+        ActivityResultContracts.OpenDocument()
+    ) { uri: Uri? ->
+        if (uri != null) {
+            lifecycleScope.launch(Dispatchers.IO) {
+                restoreFromUriWithFallback(uri)
             }
         } else {
-            if (inExcursion) {
-                inExcursion = false
-                excursionDurationSec = (now - excursionStartMs) / 1000L
-                excursionBurn = 0.0
-                prefs.edit().putLong(KEY_LAST_EXCURSION_SEC, excursionDurationSec).apply()
-            }
+            Toast.makeText(this, "Restore Cancelled", Toast.LENGTH_SHORT).show()
         }
-
-        updateNotification()
-        broadcastHud()
     }
 
-    // --- Automated HRV Capacity Governor ---
-
-    private fun fetchMorningHrv() {
-        scope.launch {
+    private val createDriveExportLauncher = registerForActivityResult(
+        ActivityResultContracts.CreateDocument("application/json")
+    ) { uri: Uri? ->
+        if (uri != null) {
             try {
-                val client = HealthConnectClient.getOrCreate(this@HavenPacingService)
-                val now = Instant.now()
-                val req = ReadRecordsRequest(
-                    recordType = HeartRateVariabilityRmssdRecord::class,
-                    timeRangeFilter = TimeRangeFilter.between(now.minus(12, ChronoUnit.HOURS), now)
-                )
-                val res = client.readRecords(req)
-                res.records.maxByOrNull { it.time }?.let { record ->
-                    applyHrv(record.heartRateVariabilityMillis)
-                }
+                val flags = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+                contentResolver.takePersistableUriPermission(uri, flags)
             } catch (_: Exception) { }
-        }
-    }
 
-    private fun applyHrv(rmssd: Double) {
-        morningHrv = rmssd
-        when {
-            rmssd >= 50.0 -> {
-                budgetCap = 20.0
-                activeCeiling = 88
-                graceMs = 120_000L
-                stability = 85
-            }
-            rmssd >= 40.0 -> {
-                budgetCap = 14.0
-                activeCeiling = 84
-                graceMs = 60_000L
-                stability = 65
-            }
-            else -> {
-                budgetCap = 10.0
-                activeCeiling = 84
-                graceMs = 60_000L
-                stability = 35
-            }
-        }
-
-        prefs.edit()
-            .putFloat(KEY_BUDGET_CAP, budgetCap.toFloat())
-            .putInt(KEY_ACTIVE_CEILING, activeCeiling)
-            .putLong(KEY_GRACE_MS, graceMs)
-            .putFloat(KEY_MORNING_HRV, rmssd.toFloat())
-            .putInt(KEY_STABILITY, stability)
-            .apply()
-
-        broadcastHud()
-        updateNotification()
-    }
-
-    private fun evaluateRollover() {
-        val cal = Calendar.getInstance()
-        if (cal.get(Calendar.HOUR_OF_DAY) < 4) cal.add(Calendar.DAY_OF_YEAR, -1)
-        val today = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(cal.time)
-        val savedDate = prefs.getString(KEY_POINTS_DATE, "")
-
-        if (savedDate != today) {
-            dailyBurn = 0.0
-            dailyPeakHr = currentHr
-            excursionDurationSec = 0L
-            inExcursion = false
-            prefs.edit()
-                .putString(KEY_POINTS_DATE, today)
-                .putFloat(KEY_DAILY_BURN, 0f)
-                .putInt(KEY_DAILY_PEAK_HR, currentHr)
-                .putLong(KEY_LAST_EXCURSION_SEC, 0L)
+            getSharedPreferences(HavenPacingService.PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putString(KEY_DRIVE_EXPORT_URI, uri.toString())
                 .apply()
-            fetchMorningHrv()
+
+            lifecycleScope.launch(Dispatchers.IO) {
+                val ok = writeLatestExportToUri(uri)
+                withContext(Dispatchers.Main) {
+                    val msg = if (ok) "Vault Linked & Exported to Google Drive!" else "Drive Write Failed"
+                    Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show()
+                }
+            }
         } else {
-            dailyBurn = prefs.getFloat(KEY_DAILY_BURN, 0f).toDouble()
-            budgetCap = prefs.getFloat(KEY_BUDGET_CAP, BASE_DAILY_BUDGET.toFloat()).toDouble()
-            activeCeiling = prefs.getInt(KEY_ACTIVE_CEILING, DEFAULT_CEILING_BPM)
-            graceMs = prefs.getLong(KEY_GRACE_MS, DEFAULT_GRACE_BUFFER_MS)
-            morningHrv = prefs.getFloat(KEY_MORNING_HRV, BASELINE_HRV_RMSSD.toFloat()).toDouble()
-            stability = prefs.getInt(KEY_STABILITY, 75)
-            val savedPeak = prefs.getInt(KEY_DAILY_PEAK_HR, 0)
-            if (savedPeak > dailyPeakHr) dailyPeakHr = savedPeak
-            if (!inExcursion) {
-                excursionDurationSec = prefs.getLong(KEY_LAST_EXCURSION_SEC, 0L)
+            Toast.makeText(this, "Saved to Downloads (Drive Not Linked)", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private val hudReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            if (intent?.action == HavenPacingService.ACTION_HUD_UPDATE) {
+                val servicePeak = intent.getIntExtra(HavenPacingService.EXTRA_PEAK_HR, 0)
+                val dailyPoints = intent.getDoubleExtra(HavenPacingService.EXTRA_DAILY_POINTS, 0.0)
+                val budgetPoints = intent.getDoubleExtra(HavenPacingService.EXTRA_BUDGET_POINTS, 20.0)
+                val excPoints = intent.getDoubleExtra(HavenPacingService.EXTRA_EXCURSION_POINTS, 0.0)
+
+                renderTelemetry(
+                    intent.getIntExtra(HavenPacingService.EXTRA_HR, 0),
+                    intent.getIntExtra(HavenPacingService.EXTRA_EXCURSION_SEC, 0),
+                    intent.getBooleanExtra(HavenPacingService.EXTRA_IN_EXCURSION, false),
+                    servicePeak,
+                    dailyPoints,
+                    budgetPoints,
+                    excPoints,
+                    intent.getIntExtra(HavenPacingService.EXTRA_STABILITY_SCORE, 75),
+                    intent.getIntExtra(HavenPacingService.EXTRA_ACTIVE_CEILING, 88),
+                    intent.getIntExtra(HavenPacingService.EXTRA_GRACE_SEC, 120),
+                    intent.getStringExtra(HavenPacingService.EXTRA_MODE) ?: "COCKPIT_LIVE",
+                    intent.getStringExtra(HavenPacingService.EXTRA_BLE_STATUS) ?: ""
+                )
             }
         }
     }
 
-    // --- Audio, HUD & Notification Sync ---
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
 
-    private fun broadcastHud() {
-        val intent = Intent(ACTION_HUD_UPDATE).apply {
-            putExtra(EXTRA_HR, currentHr)
-            putExtra(EXTRA_EXCURSION_SEC, excursionDurationSec.toInt())
-            putExtra(EXTRA_IN_EXCURSION, inExcursion)
-            putExtra(EXTRA_GRACE_SEC, (graceMs / 1000L).toInt())
-            putExtra(EXTRA_PEAK_HR, dailyPeakHr)
-            putExtra(EXTRA_DAILY_POINTS, dailyBurn)
-            putExtra(EXTRA_BUDGET_POINTS, budgetCap)
-            putExtra(EXTRA_EXCURSION_POINTS, excursionBurn)
-            putExtra(EXTRA_STABILITY_SCORE, stability)
-            putExtra(EXTRA_ACTIVE_CEILING, activeCeiling)
-            putExtra(EXTRA_MODE, "COCKPIT_LIVE")
-            putExtra(EXTRA_BLE_STATUS, bleStatus)
-            setPackage(packageName)
+        tvLiveHr = findViewById(R.id.tvLiveHr)
+        tvHrStatus = findViewById(R.id.tvHrStatus)
+        tvMode = findViewById(R.id.tvMode)
+        tvExcursion = findViewById(R.id.tvExcursion)
+        tvBudgetRemaining = findViewById(R.id.tvBudgetRemaining)
+        tvBudgetLabel = findViewById(R.id.tvBudgetLabel)
+        tvPaceStatus = findViewById(R.id.tvPaceStatus)
+        tvBufferStatus = findViewById(R.id.tvBufferStatus)
+        tvPeakIndicator = findViewById(R.id.tvPeakIndicator)
+        tvStabilityBanner = findViewById(R.id.tvStabilityBanner)
+        btnArm = findViewById(R.id.btnArm)
+        btnExport = findViewById(R.id.btnExport)
+        btnRestore = findViewById(R.id.btnRestore)
+
+        vuHr = findViewById(R.id.vuHr)
+        vuBudget = findViewById(R.id.vuBudget)
+        vuGrace = findViewById(R.id.vuGrace)
+
+        vuHr.meterType = LedVuMeterView.MeterType.HR_PROXIMITY
+        vuBudget.meterType = LedVuMeterView.MeterType.DAILY_BUDGET
+        vuGrace.meterType = LedVuMeterView.MeterType.GRACE_BUFFER
+
+        vaultManager = VaultManager(HavenDatabase.getDatabase(this))
+
+        btnArm.setOnClickListener {
+            Toast.makeText(this, "Checking BLE & Permissions...", Toast.LENGTH_SHORT).show()
+            checkPermissionsAndStartService()
         }
-        sendBroadcast(intent)
+
+        btnExport.setOnClickListener {
+            lifecycleScope.launch(Dispatchers.IO) {
+                // 1. Always write local offline backup in Downloads
+                vaultManager.exportVault(this@MainActivity)
+
+                // 2. Write directly to linked Google Drive file, or prompt to select Drive target once
+                val savedUriStr = getSharedPreferences(HavenPacingService.PREFS_NAME, Context.MODE_PRIVATE)
+                    .getString(KEY_DRIVE_EXPORT_URI, null)
+
+                if (!savedUriStr.isNullOrEmpty()) {
+                    val uri = Uri.parse(savedUriStr)
+                    val synced = writeLatestExportToUri(uri)
+                    withContext(Dispatchers.Main) {
+                        if (synced) {
+                            Toast.makeText(this@MainActivity, "Vault Exported to Google Drive!", Toast.LENGTH_SHORT).show()
+                        } else {
+                            Toast.makeText(this@MainActivity, "Select Google Drive Destination...", Toast.LENGTH_SHORT).show()
+                            createDriveExportLauncher.launch("haven_vault_export.json")
+                        }
+                    }
+                } else {
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(this@MainActivity, "Select Google Drive Folder...", Toast.LENGTH_SHORT).show()
+                        createDriveExportLauncher.launch("haven_vault_export.json")
+                    }
+                }
+            }
+        }
+
+        // Long-press EXPORT VAULT to pick a different Google Drive folder anytime
+        btnExport.setOnLongClickListener {
+            lifecycleScope.launch(Dispatchers.IO) {
+                vaultManager.exportVault(this@MainActivity)
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(this@MainActivity, "Choose New Google Drive Target...", Toast.LENGTH_SHORT).show()
+                    createDriveExportLauncher.launch("haven_vault_export.json")
+                }
+            }
+            true
+        }
+
+        btnRestore.setOnClickListener {
+            lifecycleScope.launch(Dispatchers.IO) {
+                val autoRestored = tryAutoRestoreFromDownloads()
+                if (autoRestored > 0) {
+                    withContext(Dispatchers.Main) {
+                        Toast.makeText(this@MainActivity, "Auto-Restored $autoRestored Excursions!", Toast.LENGTH_SHORT).show()
+                    }
+                } else {
+                    withContext(Dispatchers.Main) {
+                        try {
+                            restoreFileLauncher.launch(arrayOf("*/*"))
+                        } catch (e: Exception) {
+                            Toast.makeText(this@MainActivity, "Picker Error: ${e.message}", Toast.LENGTH_LONG).show()
+                        }
+                    }
+                }
+            }
+        }
+
+        renderTelemetry(0, 0, false, 0, 0.0, 20.0, 0.0, 75, 88, 120, "COCKPIT_LIVE", "BLE: READY - TAP 'ARM' TO START")
+        checkPermissionsAndStartService()
     }
 
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val chan = NotificationChannel(CHANNEL_ID, "HAVEN Telemetry", NotificationManager.IMPORTANCE_LOW)
-            chan.setShowBadge(false)
-            (getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager)?.createNotificationChannel(chan)
+    private fun writeLatestExportToUri(uri: Uri): Boolean {
+        return try {
+            val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            val candidates = listOf(
+                "haven_vault_export.json",
+                "haven_vault_backup.json",
+                "haven_vault.json"
+            )
+            var sourceFile: File? = null
+            if (downloadsDir != null && downloadsDir.exists()) {
+                for (name in candidates) {
+                    val f = File(downloadsDir, name)
+                    if (f.exists() && f.length() > 0L) {
+                        sourceFile = f
+                        break
+                    }
+                }
+                if (sourceFile == null) {
+                    sourceFile = downloadsDir.listFiles()
+                        ?.filter { it.isFile && it.name.startsWith("haven_vault") && it.name.endsWith(".json") }
+                        ?.maxByOrNull { it.lastModified() }
+                }
+            }
+
+            val payloadBytes = sourceFile?.readBytes()
+                ?: JSONObject().put("records", JSONArray()).toString().toByteArray(Charsets.UTF_8)
+
+            contentResolver.openOutputStream(uri, "wt")?.use { out ->
+                out.write(payloadBytes)
+                out.flush()
+                true
+            } ?: false
+        } catch (_: Exception) {
+            false
         }
     }
 
-    private fun buildNotification(text: String): Notification {
-        val pi = PendingIntent.getActivity(
-            this,
-            0,
-            packageManager.getLaunchIntentForPackage(packageName),
-            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+    private suspend fun tryAutoRestoreFromDownloads(): Int {
+        val candidates = listOf(
+            "haven_vault_export.json",
+            "haven_vault_backup.json",
+            "haven_vault.json"
         )
-        return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("HAVEN FLIGHT DECK")
-            .setContentText(text)
-            .setSmallIcon(android.R.drawable.stat_notify_sync)
-            .setOngoing(true)
-            .setContentIntent(pi)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .build()
+        val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        if (downloadsDir != null && downloadsDir.exists()) {
+            for (name in candidates) {
+                val file = File(downloadsDir, name)
+                if (file.exists() && file.length() > 0L) {
+                    try {
+                        val count = parseAndInsertExcursions(file.readText())
+                        if (count > 0) return count
+                    } catch (_: Exception) { }
+                }
+            }
+        }
+        return -1
     }
 
-    private fun updateNotification() {
-        val rem = budgetCap - dailyBurn
-        val txt = if (inExcursion) {
-            "EXCURSION: $currentHr BPM | REMAIN: ${String.format(Locale.US, "%.1f", rem)} PTS"
-        } else {
-            "PULSE: $currentHr BPM | PEAK: $dailyPeakHr | REMAIN: ${String.format(Locale.US, "%.1f", rem)} PTS"
+    private suspend fun restoreFromUriWithFallback(uri: Uri) {
+        var count = -1
+        try {
+            count = vaultManager.restoreVaultFromUri(this@MainActivity, uri)
+        } catch (_: Exception) {
+            count = -1
         }
-        (getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager)?.notify(NOTIFICATION_ID, buildNotification(txt))
+
+        if (count >= 0) {
+            withContext(Dispatchers.Main) {
+                Toast.makeText(this@MainActivity, "Restored $count Excursions!", Toast.LENGTH_SHORT).show()
+            }
+            return
+        }
+
+        try {
+            val jsonText = contentResolver.openInputStream(uri)?.use { stream ->
+                stream.bufferedReader().readText()
+            }
+            if (!jsonText.isNullOrEmpty()) {
+                val fallbackCount = parseAndInsertExcursions(jsonText)
+                withContext(Dispatchers.Main) {
+                    if (fallbackCount >= 0) {
+                        Toast.makeText(this@MainActivity, "Restored $fallbackCount Excursions!", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(this@MainActivity, "Restore Failed: Empty or invalid vault", Toast.LENGTH_LONG).show()
+                    }
+                }
+            } else {
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(this@MainActivity, "Restore Failed: Could not read file stream", Toast.LENGTH_LONG).show()
+                }
+            }
+        } catch (e: Exception) {
+            withContext(Dispatchers.Main) {
+                Toast.makeText(this@MainActivity, "Restore Error: ${e.message}", Toast.LENGTH_LONG).show()
+            }
+        }
+    }
+
+    private suspend fun parseAndInsertExcursions(jsonString: String): Int {
+        val trimmed = jsonString.trim()
+        val jsonArray = if (trimmed.startsWith("[")) {
+            JSONArray(trimmed)
+        } else {
+            val obj = JSONObject(trimmed)
+            when {
+                obj.has("records") -> obj.getJSONArray("records")
+                obj.has("excursions") -> obj.getJSONArray("excursions")
+                obj.has("data") -> obj.getJSONArray("data")
+                else -> {
+                    var found: JSONArray? = null
+                    val keys = obj.keys()
+                    while (keys.hasNext()) {
+                        val key = keys.next()
+                        val v = obj.optJSONArray(key)
+                        if (v != null) {
+                            found = v
+                            break
+                        }
+                    }
+                    found ?: return -1
+                }
+            }
+        }
+
+        val db = HavenDatabase.getDatabase(this@MainActivity)
+        var count = 0
+        for (i in 0 until jsonArray.length()) {
+            val item = jsonArray.getJSONObject(i)
+            val ts = item.optLong("timestamp", item.optLong("time", System.currentTimeMillis()))
+            val dur = item.optInt("durationSeconds", item.optInt("duration", 0))
+            val peak = item.optInt("peakHr", item.optInt("peak", 0))
+            val settled = item.optInt("settledHr", item.optInt("settled", 0))
+            val strain = item.optDouble("strainPoints", item.optDouble("points", 0.0))
+
+            val record = ExcursionRecord(
+                timestamp = ts,
+                durationSeconds = dur,
+                peakHr = peak,
+                settledHr = settled,
+                strainPoints = strain
+            )
+            db.havenDao().insert(record)
+            count++
+        }
+        return count
+    }
+
+    override fun onResume() {
+        super.onResume()
+        val filter = IntentFilter(HavenPacingService.ACTION_HUD_UPDATE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(hudReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            registerReceiver(hudReceiver, filter)
+        }
+
+        if (HavenPacingService.isServiceRunning) {
+            btnArm.text = "ENGINE ACTIVE (ARMED)"
+            btnArm.setTextColor(Color.parseColor("#00E676"))
+            try {
+                startService(Intent(this, HavenPacingService::class.java))
+            } catch (_: Exception) { }
+        } else {
+            btnArm.text = "START PACING ENGINE"
+            btnArm.setTextColor(Color.WHITE)
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        try {
+            unregisterReceiver(hudReceiver)
+        } catch (_: Exception) { }
+    }
+
+    private fun renderTelemetry(
+        hr: Int,
+        excSec: Int,
+        inExcursion: Boolean,
+        servicePeakHr: Int,
+        dailyPoints: Double,
+        budgetPoints: Double,
+        excPoints: Double,
+        stability: Int,
+        ceiling: Int,
+        graceSec: Int,
+        mode: String,
+        bleStatus: String = ""
+    ) {
+        // 1. Live BPM and Proximity Bar
+        if (hr > 0) {
+            tvLiveHr.text = hr.toString()
+            vuHr.setLevel((hr - 40).coerceAtLeast(0).toFloat(), 70f)
+            when {
+                hr <= 75 -> {
+                    tvLiveHr.setTextColor(Color.parseColor("#00E676"))
+                    tvHrStatus.text = "BPM / FLOOR: RECOVERED (<=75)"
+                }
+                hr < ceiling -> {
+                    tvLiveHr.setTextColor(Color.WHITE)
+                    tvHrStatus.text = "BPM / SAFE ACTIVE ZONE"
+                }
+                hr < ceiling + 3 -> {
+                    tvLiveHr.setTextColor(Color.parseColor("#FF9100"))
+                    tvHrStatus.text = "BPM / CEILING WARNING"
+                }
+                else -> {
+                    tvLiveHr.setTextColor(Color.parseColor("#FF5252"))
+                    tvHrStatus.text = "BPM / CEILING BREACH (" + ceiling + ")"
+                }
+            }
+        } else {
+            tvLiveHr.text = "--"
+            tvLiveHr.setTextColor(Color.parseColor("#8E8E93"))
+            tvHrStatus.text = if (bleStatus.isNotEmpty()) bleStatus else "BLE: SEARCHING..."
+        }
+
+        // 2. Indefinite Peak Latching Logic
+        if (inExcursion) {
+            if (currentSurgePeakHr == 0 || hr > currentSurgePeakHr) {
+                currentSurgePeakHr = hr
+            }
+            if (currentSurgePeakHr > latchedPeakHr) {
+                latchedPeakHr = currentSurgePeakHr
+            }
+        } else {
+            currentSurgePeakHr = 0
+        }
+
+        if (servicePeakHr > latchedPeakHr) {
+            latchedPeakHr = servicePeakHr
+        }
+        if (hr >= ceiling && hr > latchedPeakHr) {
+            latchedPeakHr = hr
+        }
+
+        // High-contrast latched peak readout
+        if (latchedPeakHr > 0) {
+            tvPeakIndicator.text = "PEAK: " + latchedPeakHr + " BPM"
+            if (latchedPeakHr >= 115) {
+                tvPeakIndicator.setTextColor(Color.parseColor("#FF1744"))
+            } else if (latchedPeakHr >= ceiling) {
+                tvPeakIndicator.setTextColor(Color.parseColor("#FF5252"))
+            } else if (latchedPeakHr >= 76) {
+                tvPeakIndicator.setTextColor(Color.parseColor("#FFEA00"))
+            } else {
+                tvPeakIndicator.setTextColor(Color.parseColor("#00E676"))
+            }
+        } else {
+            tvPeakIndicator.text = "PEAK: --"
+            tvPeakIndicator.setTextColor(Color.parseColor("#8E8E93"))
+        }
+
+        // 3. Excursion Stopwatch & Grace Buffer
+        val safeGrace = graceSec.coerceAtLeast(1)
+        if (inExcursion) {
+            lastRecordedExcursionSec = excSec
+            val m = excSec / 60
+            val s = excSec % 60
+            tvExcursion.text = String.format("%02d:%02d", m, s)
+            tvExcursion.setTextColor(Color.parseColor("#FF9100"))
+
+            vuGrace.setLevel(excSec.coerceAtMost(safeGrace).toFloat(), safeGrace.toFloat())
+            val remainingGrace = (safeGrace - excSec).coerceAtLeast(0)
+            if (remainingGrace > 0) {
+                tvBufferStatus.text = "ACTIVE (" + remainingGrace + "s LEFT)"
+                tvBufferStatus.setTextColor(Color.parseColor("#FF9100"))
+            } else {
+                val overSec = excSec - safeGrace
+                tvBufferStatus.text = "OVERAGE (+" + overSec + "s)"
+                tvBufferStatus.setTextColor(Color.parseColor("#FF5252"))
+            }
+        } else {
+            if (excSec > 0) {
+                lastRecordedExcursionSec = excSec
+            }
+            val m = lastRecordedExcursionSec / 60
+            val s = lastRecordedExcursionSec % 60
+            tvExcursion.text = String.format("%02d:%02d", m, s)
+            tvExcursion.setTextColor(Color.WHITE)
+
+            vuGrace.setLevel(0f, safeGrace.toFloat())
+            tvBufferStatus.text = "STANDBY"
+            tvBufferStatus.setTextColor(Color.parseColor("#8E8E93"))
+        }
+
+        // 4. Weighted PacePoint Budget Burn & Remaining Points
+        tvBudgetLabel.text = String.format("PACE POINTS (%.0f CAP)", budgetPoints)
+        vuBudget.setLevel(dailyPoints.toFloat(), budgetPoints.toFloat())
+
+        val remainingPoints = budgetPoints - dailyPoints
+        if (remainingPoints >= 0) {
+            tvBudgetRemaining.text = String.format("%.1f PTS", remainingPoints)
+            tvBudgetRemaining.setTextColor(Color.parseColor("#00E676"))
+
+            if (dailyPoints >= budgetPoints * 0.75) {
+                tvPaceStatus.text = "PACE: GUARDED"
+                tvPaceStatus.setTextColor(Color.parseColor("#FF9100"))
+            } else {
+                tvPaceStatus.text = "PACE: ON TRACK"
+                tvPaceStatus.setTextColor(Color.parseColor("#00E676"))
+            }
+        } else {
+            val debtPoints = -remainingPoints
+            tvBudgetRemaining.text = String.format("-%.1f PTS", debtPoints)
+            tvBudgetRemaining.setTextColor(Color.parseColor("#FF5252"))
+            tvPaceStatus.text = "PACE: OVER BUDGET"
+            tvPaceStatus.setTextColor(Color.parseColor("#FF5252"))
+        }
+
+        // 5. Morning Stability Panel (0-100)
+        val stabilityTier = when {
+            stability >= 85 -> "[OPTIMAL]"
+            stability >= 70 -> "[STABLE]"
+            stability >= 50 -> "[GUARDED]"
+            stability >= 30 -> "[VULNERABLE]"
+            else            -> "[VETO / CRASH]"
+        }
+        tvStabilityBanner.text = String.format("STABILITY: %d/100 %s | CEIL: %d | BUD: %.0f PTS", stability, stabilityTier, ceiling, budgetPoints)
+        val bannerColor = when {
+            stability >= 70 -> Color.parseColor("#00E676")
+            stability >= 50 -> Color.parseColor("#FFEA00")
+            stability >= 30 -> Color.parseColor("#FF9100")
+            else            -> Color.parseColor("#FF1744")
+        }
+        tvStabilityBanner.setTextColor(bannerColor)
+
+        // 6. Cockpit Mode
+        if (mode == "COCKPIT_DARK") {
+            tvMode.text = "[ COCKPIT DARK ]"
+            tvMode.setTextColor(Color.parseColor("#757575"))
+        } else {
+            tvMode.text = "[ COCKPIT LIVE ]"
+            tvMode.setTextColor(Color.parseColor("#00E676"))
+        }
+    }
+
+    private fun checkPermissionsAndStartService() {
+        val permissions = mutableListOf(
+            Manifest.permission.ACCESS_FINE_LOCATION,
+            Manifest.permission.ACCESS_COARSE_LOCATION
+        )
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            permissions.add(Manifest.permission.BLUETOOTH_SCAN)
+            permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+        }
+
+        val missing = permissions.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+
+        if (missing.isNotEmpty()) {
+            Toast.makeText(this, "Requesting OS Permissions...", Toast.LENGTH_SHORT).show()
+            ActivityCompat.requestPermissions(this, missing.toTypedArray(), 101)
+        } else {
+            startHavenService()
+        }
+    }
+
+    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+        if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
+            Toast.makeText(this, "Permissions Granted!", Toast.LENGTH_SHORT).show()
+            startHavenService()
+        } else {
+            Toast.makeText(this, "Permission Denied in OS! Enable in App Settings", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    private fun startHavenService() {
+        val serviceIntent = Intent(this, HavenPacingService::class.java)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                startForegroundService(serviceIntent)
+            } else {
+                startService(serviceIntent)
+            }
+            btnArm.text = "ENGINE ACTIVE (ARMED)"
+            btnArm.setTextColor(Color.parseColor("#00E676"))
+            Toast.makeText(this, "Haven Engine Starting...", Toast.LENGTH_SHORT).show()
+        } catch (e: Exception) {
+            Toast.makeText(this, "Service Start Error: " + e.message, Toast.LENGTH_LONG).show()
+        }
     }
 
     companion object {
-        const val CHANNEL_ID = "haven_telemetry"
-        const val NOTIFICATION_ID = 1042
-        const val PREFS_NAME = "haven_pacing_prefs"
-
-        var isServiceRunning = false
-
-        const val BASE_DAILY_BUDGET = 20.0
-        const val DEFAULT_CEILING_BPM = 88
-        const val DEFAULT_GRACE_BUFFER_MS = 120_000L
-        const val BASELINE_HRV_RMSSD = 50.0
-
-        const val KEY_DAILY_BURN = "daily_burned"
-        const val KEY_BUDGET_CAP = "budget_cap"
-        const val KEY_POINTS_DATE = "points_date"
-        const val KEY_MORNING_HRV = "morning_hrv"
-        const val KEY_ACTIVE_CEILING = "active_ceiling"
-        const val KEY_GRACE_MS = "grace_ms"
-        const val KEY_STABILITY = "stability"
-        const val KEY_SAVED_DEVICE_ADDR = "saved_device_addr"
-        const val KEY_DAILY_PEAK_HR = "daily_peak_hr"
-        const val KEY_LAST_EXCURSION_SEC = "last_excursion_sec"
-
-        const val ACTION_HUD_UPDATE = "com.haven.pacing.ACTION_HUD_UPDATE"
-        const val EXTRA_HR = "extra_hr"
-        const val EXTRA_EXCURSION_SEC = "extra_excursion_sec"
-        const val EXTRA_IN_EXCURSION = "extra_in_excursion"
-        const val EXTRA_GRACE_SEC = "extra_grace_sec"
-        const val EXTRA_PEAK_HR = "extra_peak_hr"
-        const val EXTRA_DAILY_POINTS = "extra_daily_points"
-        const val EXTRA_BUDGET_POINTS = "extra_budget_points"
-        const val EXTRA_EXCURSION_POINTS = "extra_excursion_points"
-        const val EXTRA_STABILITY_SCORE = "extra_stability_score"
-        const val EXTRA_ACTIVE_CEILING = "extra_active_ceiling"
-        const val EXTRA_MODE = "extra_mode"
-        const val EXTRA_BLE_STATUS = "extra_ble_status"
-
-        val UUID_HR_SERVICE: UUID = UUID.fromString("0000180d-0000-1000-8000-00805f9b34fb")
-        val UUID_HR_MEASURE: UUID = UUID.fromString("00002a37-0000-1000-8000-00805f9b34fb")
-        val UUID_CLIENT_CONFIG: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+        private const val KEY_DRIVE_EXPORT_URI = "drive_export_uri"
     }
 }
