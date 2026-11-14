@@ -18,6 +18,13 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.health.connect.client.HealthConnectClient
+import androidx.health.connect.client.PermissionController
+import androidx.health.connect.client.permission.HealthPermission
+import androidx.health.connect.client.records.HeartRateVariabilityRmssdRecord
+import androidx.health.connect.client.records.RestingHeartRateRecord
+import androidx.health.connect.client.request.ReadRecordsRequest
+import androidx.health.connect.client.time.TimeRangeFilter
 import androidx.lifecycle.lifecycleScope
 import com.haven.pacing.data.ExcursionRecord
 import com.haven.pacing.data.HavenDatabase
@@ -29,6 +36,11 @@ import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
+import java.time.temporal.ChronoUnit
+import java.util.Locale
 
 class MainActivity : AppCompatActivity() {
 
@@ -56,6 +68,22 @@ class MainActivity : AppCompatActivity() {
     // Indefinite Latched Peak Memory for POTS visual anchoring
     private var latchedPeakHr: Int = 0
     private var currentSurgePeakHr: Int = 0
+
+    private val healthPermissions = setOf(
+        HealthPermission.getReadPermission(HeartRateVariabilityRmssdRecord::class),
+        HealthPermission.getReadPermission(RestingHeartRateRecord::class)
+    )
+
+    private val requestHealthPermissions = registerForActivityResult(
+        PermissionController.createRequestPermissionResultContract()
+    ) { granted ->
+        if (granted.containsAll(healthPermissions)) {
+            Toast.makeText(this, "Health Connect Linked! Exporting 30-Day Vault...", Toast.LENGTH_SHORT).show()
+        } else {
+            Toast.makeText(this, "Health Connect Access Skipped — Exporting Excursions...", Toast.LENGTH_SHORT).show()
+        }
+        runFullVaultExport()
+    }
 
     private val restoreFileLauncher = registerForActivityResult(
         ActivityResultContracts.OpenDocument()
@@ -86,7 +114,7 @@ class MainActivity : AppCompatActivity() {
             lifecycleScope.launch(Dispatchers.IO) {
                 val ok = writeLatestExportToUri(uri)
                 withContext(Dispatchers.Main) {
-                    val msg = if (ok) "Vault Linked & Exported to Google Drive!" else "Drive Write Failed"
+                    val msg = if (ok) "30-Day Vault Exported to Google Drive!" else "Drive Write Failed"
                     Toast.makeText(this@MainActivity, msg, Toast.LENGTH_SHORT).show()
                 }
             }
@@ -156,29 +184,24 @@ class MainActivity : AppCompatActivity() {
 
         btnExport.setOnClickListener {
             lifecycleScope.launch(Dispatchers.IO) {
-                // 1. Always write local offline backup in Downloads
-                vaultManager.exportVault(this@MainActivity)
+                val needsHealthPrompt = try {
+                    val client = HealthConnectClient.getOrCreate(this@MainActivity)
+                    val granted = client.permissionController.getGrantedPermissions()
+                    !granted.containsAll(healthPermissions)
+                } catch (_: Exception) {
+                    false
+                }
 
-                // 2. Write directly to linked Google Drive file, or prompt to select Drive target once
-                val savedUriStr = getSharedPreferences(HavenPacingService.PREFS_NAME, Context.MODE_PRIVATE)
-                    .getString(KEY_DRIVE_EXPORT_URI, null)
-
-                if (!savedUriStr.isNullOrEmpty()) {
-                    val uri = Uri.parse(savedUriStr)
-                    val synced = writeLatestExportToUri(uri)
+                if (needsHealthPrompt) {
                     withContext(Dispatchers.Main) {
-                        if (synced) {
-                            Toast.makeText(this@MainActivity, "Vault Exported to Google Drive!", Toast.LENGTH_SHORT).show()
-                        } else {
-                            Toast.makeText(this@MainActivity, "Select Google Drive Destination...", Toast.LENGTH_SHORT).show()
-                            createDriveExportLauncher.launch("haven_vault_export.json")
+                        try {
+                            requestHealthPermissions.launch(healthPermissions)
+                        } catch (_: Exception) {
+                            runFullVaultExport()
                         }
                     }
                 } else {
-                    withContext(Dispatchers.Main) {
-                        Toast.makeText(this@MainActivity, "Select Google Drive Folder...", Toast.LENGTH_SHORT).show()
-                        createDriveExportLauncher.launch("haven_vault_export.json")
-                    }
+                    runFullVaultExport()
                 }
             }
         }
@@ -187,6 +210,7 @@ class MainActivity : AppCompatActivity() {
         btnExport.setOnLongClickListener {
             lifecycleScope.launch(Dispatchers.IO) {
                 vaultManager.exportVault(this@MainActivity)
+                buildEnrichedVaultBytes()
                 withContext(Dispatchers.Main) {
                     Toast.makeText(this@MainActivity, "Choose New Google Drive Target...", Toast.LENGTH_SHORT).show()
                     createDriveExportLauncher.launch("haven_vault_export.json")
@@ -218,33 +242,129 @@ class MainActivity : AppCompatActivity() {
         checkPermissionsAndStartService()
     }
 
-    private fun writeLatestExportToUri(uri: Uri): Boolean {
-        return try {
-            val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
-            val candidates = listOf(
-                "haven_vault_export.json",
-                "haven_vault_backup.json",
-                "haven_vault.json"
-            )
-            var sourceFile: File? = null
-            if (downloadsDir != null && downloadsDir.exists()) {
-                for (name in candidates) {
-                    val f = File(downloadsDir, name)
-                    if (f.exists() && f.length() > 0L) {
-                        sourceFile = f
-                        break
+    private fun runFullVaultExport() {
+        lifecycleScope.launch(Dispatchers.IO) {
+            vaultManager.exportVault(this@MainActivity)
+
+            val savedUriStr = getSharedPreferences(HavenPacingService.PREFS_NAME, Context.MODE_PRIVATE)
+                .getString(KEY_DRIVE_EXPORT_URI, null)
+
+            if (!savedUriStr.isNullOrEmpty()) {
+                val uri = Uri.parse(savedUriStr)
+                val synced = writeLatestExportToUri(uri)
+                withContext(Dispatchers.Main) {
+                    if (synced) {
+                        Toast.makeText(this@MainActivity, "30-Day Vault Exported to Google Drive!", Toast.LENGTH_SHORT).show()
+                    } else {
+                        Toast.makeText(this@MainActivity, "Select Google Drive Destination...", Toast.LENGTH_SHORT).show()
+                        createDriveExportLauncher.launch("haven_vault_export.json")
                     }
                 }
-                if (sourceFile == null) {
-                    sourceFile = downloadsDir.listFiles()
-                        ?.filter { it.isFile && it.name.startsWith("haven_vault") && it.name.endsWith(".json") }
-                        ?.maxByOrNull { it.lastModified() }
+            } else {
+                buildEnrichedVaultBytes()
+                withContext(Dispatchers.Main) {
+                    Toast.makeText(this@MainActivity, "Select Google Drive Folder...", Toast.LENGTH_SHORT).show()
+                    createDriveExportLauncher.launch("haven_vault_export.json")
                 }
             }
+        }
+    }
 
-            val payloadBytes = sourceFile?.readBytes()
-                ?: JSONObject().put("records", JSONArray()).toString().toByteArray(Charsets.UTF_8)
+    private suspend fun buildEnrichedVaultBytes(): ByteArray {
+        val downloadsDir = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+        val candidates = listOf(
+            "haven_vault_export.json",
+            "haven_vault_backup.json",
+            "haven_vault.json"
+        )
+        var sourceFile: File? = null
+        if (downloadsDir != null && downloadsDir.exists()) {
+            for (name in candidates) {
+                val f = File(downloadsDir, name)
+                if (f.exists() && f.length() > 0L) {
+                    sourceFile = f
+                    break
+                }
+            }
+            if (sourceFile == null) {
+                sourceFile = downloadsDir.listFiles()
+                    ?.filter { it.isFile && it.name.startsWith("haven_vault") && it.name.endsWith(".json") }
+                    ?.maxByOrNull { it.lastModified() }
+            }
+        }
 
+        val rootObj = try {
+            val raw = sourceFile?.readText(Charsets.UTF_8)?.trim() ?: ""
+            when {
+                raw.startsWith("{") -> JSONObject(raw)
+                raw.startsWith("[") -> JSONObject().put("records", JSONArray(raw))
+                else -> JSONObject().put("records", JSONArray())
+            }
+        } catch (_: Exception) {
+            JSONObject().put("records", JSONArray())
+        }
+
+        val dailyBioObj = rootObj.optJSONObject("dailyBio") ?: JSONObject()
+        val zone = ZoneId.systemDefault()
+        val dayFmt = DateTimeFormatter.ofPattern("yyyy-MM-dd", Locale.US)
+
+        fun instantToDayKey(inst: Instant): String {
+            var zdt = inst.atZone(zone)
+            if (zdt.hour < 4) zdt = zdt.minusDays(1)
+            return zdt.format(dayFmt)
+        }
+
+        try {
+            val client = HealthConnectClient.getOrCreate(this@MainActivity)
+            val now = Instant.now()
+            val start = now.minus(30, ChronoUnit.DAYS)
+
+            // 1. Pull 30 days of overnight HRV (rMSSD)
+            try {
+                val hrvRes = client.readRecords(
+                    ReadRecordsRequest(
+                        recordType = HeartRateVariabilityRmssdRecord::class,
+                        timeRangeFilter = TimeRangeFilter.between(start, now)
+                    )
+                )
+                for (rec in hrvRes.records) {
+                    val key = instantToDayKey(rec.time)
+                    val entry = dailyBioObj.optJSONObject(key) ?: JSONObject()
+                    val rounded = Math.round(rec.heartRateVariabilityMillis * 10.0) / 10.0
+                    entry.put("hrv", rounded)
+                    dailyBioObj.put(key, entry)
+                }
+            } catch (_: Exception) { }
+
+            // 2. Pull 30 days of Resting Heart Rate
+            try {
+                val rhrRes = client.readRecords(
+                    ReadRecordsRequest(
+                        recordType = RestingHeartRateRecord::class,
+                        timeRangeFilter = TimeRangeFilter.between(start, now)
+                    )
+                )
+                for (rec in rhrRes.records) {
+                    val key = instantToDayKey(rec.time)
+                    val entry = dailyBioObj.optJSONObject(key) ?: JSONObject()
+                    entry.put("floorHr", rec.beatsPerMinute.toInt())
+                    dailyBioObj.put(key, entry)
+                }
+            } catch (_: Exception) { }
+        } catch (_: Exception) { }
+
+        rootObj.put("dailyBio", dailyBioObj)
+        val finalText = rootObj.toString(2)
+        try {
+            sourceFile?.writeText(finalText, Charsets.UTF_8)
+        } catch (_: Exception) { }
+
+        return finalText.toByteArray(Charsets.UTF_8)
+    }
+
+    private suspend fun writeLatestExportToUri(uri: Uri): Boolean {
+        return try {
+            val payloadBytes = buildEnrichedVaultBytes()
             contentResolver.openOutputStream(uri, "wt")?.use { out ->
                 out.write(payloadBytes)
                 out.flush()
@@ -310,303 +430,4 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         } catch (e: Exception) {
-            withContext(Dispatchers.Main) {
-                Toast.makeText(this@MainActivity, "Restore Error: ${e.message}", Toast.LENGTH_LONG).show()
-            }
-        }
-    }
-
-    private suspend fun parseAndInsertExcursions(jsonString: String): Int {
-        val trimmed = jsonString.trim()
-        val jsonArray = if (trimmed.startsWith("[")) {
-            JSONArray(trimmed)
-        } else {
-            val obj = JSONObject(trimmed)
-            when {
-                obj.has("records") -> obj.getJSONArray("records")
-                obj.has("excursions") -> obj.getJSONArray("excursions")
-                obj.has("data") -> obj.getJSONArray("data")
-                else -> {
-                    var found: JSONArray? = null
-                    val keys = obj.keys()
-                    while (keys.hasNext()) {
-                        val key = keys.next()
-                        val v = obj.optJSONArray(key)
-                        if (v != null) {
-                            found = v
-                            break
-                        }
-                    }
-                    found ?: return -1
-                }
-            }
-        }
-
-        val db = HavenDatabase.getDatabase(this@MainActivity)
-        var count = 0
-        for (i in 0 until jsonArray.length()) {
-            val item = jsonArray.getJSONObject(i)
-            val ts = item.optLong("timestamp", item.optLong("time", System.currentTimeMillis()))
-            val dur = item.optInt("durationSeconds", item.optInt("duration", 0))
-            val peak = item.optInt("peakHr", item.optInt("peak", 0))
-            val settled = item.optInt("settledHr", item.optInt("settled", 0))
-            val strain = item.optDouble("strainPoints", item.optDouble("points", 0.0))
-
-            val record = ExcursionRecord(
-                timestamp = ts,
-                durationSeconds = dur,
-                peakHr = peak,
-                settledHr = settled,
-                strainPoints = strain
-            )
-            db.havenDao().insert(record)
-            count++
-        }
-        return count
-    }
-
-    override fun onResume() {
-        super.onResume()
-        val filter = IntentFilter(HavenPacingService.ACTION_HUD_UPDATE)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(hudReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
-        } else {
-            registerReceiver(hudReceiver, filter)
-        }
-
-        if (HavenPacingService.isServiceRunning) {
-            btnArm.text = "ENGINE ACTIVE (ARMED)"
-            btnArm.setTextColor(Color.parseColor("#00E676"))
-            try {
-                startService(Intent(this, HavenPacingService::class.java))
-            } catch (_: Exception) { }
-        } else {
-            btnArm.text = "START PACING ENGINE"
-            btnArm.setTextColor(Color.WHITE)
-        }
-    }
-
-    override fun onPause() {
-        super.onPause()
-        try {
-            unregisterReceiver(hudReceiver)
-        } catch (_: Exception) { }
-    }
-
-    private fun renderTelemetry(
-        hr: Int,
-        excSec: Int,
-        inExcursion: Boolean,
-        servicePeakHr: Int,
-        dailyPoints: Double,
-        budgetPoints: Double,
-        excPoints: Double,
-        stability: Int,
-        ceiling: Int,
-        graceSec: Int,
-        mode: String,
-        bleStatus: String = ""
-    ) {
-        // 1. Live BPM and Proximity Bar
-        if (hr > 0) {
-            tvLiveHr.text = hr.toString()
-            vuHr.setLevel((hr - 40).coerceAtLeast(0).toFloat(), 70f)
-            when {
-                hr <= 75 -> {
-                    tvLiveHr.setTextColor(Color.parseColor("#00E676"))
-                    tvHrStatus.text = "BPM / FLOOR: RECOVERED (<=75)"
-                }
-                hr < ceiling -> {
-                    tvLiveHr.setTextColor(Color.WHITE)
-                    tvHrStatus.text = "BPM / SAFE ACTIVE ZONE"
-                }
-                hr < ceiling + 3 -> {
-                    tvLiveHr.setTextColor(Color.parseColor("#FF9100"))
-                    tvHrStatus.text = "BPM / CEILING WARNING"
-                }
-                else -> {
-                    tvLiveHr.setTextColor(Color.parseColor("#FF5252"))
-                    tvHrStatus.text = "BPM / CEILING BREACH (" + ceiling + ")"
-                }
-            }
-        } else {
-            tvLiveHr.text = "--"
-            tvLiveHr.setTextColor(Color.parseColor("#8E8E93"))
-            tvHrStatus.text = if (bleStatus.isNotEmpty()) bleStatus else "BLE: SEARCHING..."
-        }
-
-        // 2. Indefinite Peak Latching Logic
-        if (inExcursion) {
-            if (currentSurgePeakHr == 0 || hr > currentSurgePeakHr) {
-                currentSurgePeakHr = hr
-            }
-            if (currentSurgePeakHr > latchedPeakHr) {
-                latchedPeakHr = currentSurgePeakHr
-            }
-        } else {
-            currentSurgePeakHr = 0
-        }
-
-        if (servicePeakHr > latchedPeakHr) {
-            latchedPeakHr = servicePeakHr
-        }
-        if (hr >= ceiling && hr > latchedPeakHr) {
-            latchedPeakHr = hr
-        }
-
-        // High-contrast latched peak readout
-        if (latchedPeakHr > 0) {
-            tvPeakIndicator.text = "PEAK: " + latchedPeakHr + " BPM"
-            if (latchedPeakHr >= 115) {
-                tvPeakIndicator.setTextColor(Color.parseColor("#FF1744"))
-            } else if (latchedPeakHr >= ceiling) {
-                tvPeakIndicator.setTextColor(Color.parseColor("#FF5252"))
-            } else if (latchedPeakHr >= 76) {
-                tvPeakIndicator.setTextColor(Color.parseColor("#FFEA00"))
-            } else {
-                tvPeakIndicator.setTextColor(Color.parseColor("#00E676"))
-            }
-        } else {
-            tvPeakIndicator.text = "PEAK: --"
-            tvPeakIndicator.setTextColor(Color.parseColor("#8E8E93"))
-        }
-
-        // 3. Excursion Stopwatch & Grace Buffer
-        val safeGrace = graceSec.coerceAtLeast(1)
-        if (inExcursion) {
-            lastRecordedExcursionSec = excSec
-            val m = excSec / 60
-            val s = excSec % 60
-            tvExcursion.text = String.format("%02d:%02d", m, s)
-            tvExcursion.setTextColor(Color.parseColor("#FF9100"))
-
-            vuGrace.setLevel(excSec.coerceAtMost(safeGrace).toFloat(), safeGrace.toFloat())
-            val remainingGrace = (safeGrace - excSec).coerceAtLeast(0)
-            if (remainingGrace > 0) {
-                tvBufferStatus.text = "ACTIVE (" + remainingGrace + "s LEFT)"
-                tvBufferStatus.setTextColor(Color.parseColor("#FF9100"))
-            } else {
-                val overSec = excSec - safeGrace
-                tvBufferStatus.text = "OVERAGE (+" + overSec + "s)"
-                tvBufferStatus.setTextColor(Color.parseColor("#FF5252"))
-            }
-        } else {
-            if (excSec > 0) {
-                lastRecordedExcursionSec = excSec
-            }
-            val m = lastRecordedExcursionSec / 60
-            val s = lastRecordedExcursionSec % 60
-            tvExcursion.text = String.format("%02d:%02d", m, s)
-            tvExcursion.setTextColor(Color.WHITE)
-
-            vuGrace.setLevel(0f, safeGrace.toFloat())
-            tvBufferStatus.text = "STANDBY"
-            tvBufferStatus.setTextColor(Color.parseColor("#8E8E93"))
-        }
-
-        // 4. Weighted PacePoint Budget Burn & Remaining Points
-        tvBudgetLabel.text = String.format("PACE POINTS (%.0f CAP)", budgetPoints)
-        vuBudget.setLevel(dailyPoints.toFloat(), budgetPoints.toFloat())
-
-        val remainingPoints = budgetPoints - dailyPoints
-        if (remainingPoints >= 0) {
-            tvBudgetRemaining.text = String.format("%.1f PTS", remainingPoints)
-            tvBudgetRemaining.setTextColor(Color.parseColor("#00E676"))
-
-            if (dailyPoints >= budgetPoints * 0.75) {
-                tvPaceStatus.text = "PACE: GUARDED"
-                tvPaceStatus.setTextColor(Color.parseColor("#FF9100"))
-            } else {
-                tvPaceStatus.text = "PACE: ON TRACK"
-                tvPaceStatus.setTextColor(Color.parseColor("#00E676"))
-            }
-        } else {
-            val debtPoints = -remainingPoints
-            tvBudgetRemaining.text = String.format("-%.1f PTS", debtPoints)
-            tvBudgetRemaining.setTextColor(Color.parseColor("#FF5252"))
-            tvPaceStatus.text = "PACE: OVER BUDGET"
-            tvPaceStatus.setTextColor(Color.parseColor("#FF5252"))
-        }
-
-        // 5. Morning Stability Panel (0-100)
-        val stabilityTier = when {
-            stability >= 85 -> "[OPTIMAL]"
-            stability >= 70 -> "[STABLE]"
-            stability >= 50 -> "[GUARDED]"
-            stability >= 30 -> "[VULNERABLE]"
-            else            -> "[VETO / CRASH]"
-        }
-        tvStabilityBanner.text = String.format("STABILITY: %d/100 %s | CEIL: %d | BUD: %.0f PTS", stability, stabilityTier, ceiling, budgetPoints)
-        val bannerColor = when {
-            stability >= 70 -> Color.parseColor("#00E676")
-            stability >= 50 -> Color.parseColor("#FFEA00")
-            stability >= 30 -> Color.parseColor("#FF9100")
-            else            -> Color.parseColor("#FF1744")
-        }
-        tvStabilityBanner.setTextColor(bannerColor)
-
-        // 6. Cockpit Mode
-        if (mode == "COCKPIT_DARK") {
-            tvMode.text = "[ COCKPIT DARK ]"
-            tvMode.setTextColor(Color.parseColor("#757575"))
-        } else {
-            tvMode.text = "[ COCKPIT LIVE ]"
-            tvMode.setTextColor(Color.parseColor("#00E676"))
-        }
-    }
-
-    private fun checkPermissionsAndStartService() {
-        val permissions = mutableListOf(
-            Manifest.permission.ACCESS_FINE_LOCATION,
-            Manifest.permission.ACCESS_COARSE_LOCATION
-        )
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            permissions.add(Manifest.permission.BLUETOOTH_SCAN)
-            permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
-        }
-
-        val missing = permissions.filter {
-            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
-        }
-
-        if (missing.isNotEmpty()) {
-            Toast.makeText(this, "Requesting OS Permissions...", Toast.LENGTH_SHORT).show()
-            ActivityCompat.requestPermissions(this, missing.toTypedArray(), 101)
-        } else {
-            startHavenService()
-        }
-    }
-
-    override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
-        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
-        if (grantResults.isNotEmpty() && grantResults.all { it == PackageManager.PERMISSION_GRANTED }) {
-            Toast.makeText(this, "Permissions Granted!", Toast.LENGTH_SHORT).show()
-            startHavenService()
-        } else {
-            Toast.makeText(this, "Permission Denied in OS! Enable in App Settings", Toast.LENGTH_LONG).show()
-        }
-    }
-
-    private fun startHavenService() {
-        val serviceIntent = Intent(this, HavenPacingService::class.java)
-        try {
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                startForegroundService(serviceIntent)
-            } else {
-                startService(serviceIntent)
-            }
-            btnArm.text = "ENGINE ACTIVE (ARMED)"
-            btnArm.setTextColor(Color.parseColor("#00E676"))
-            Toast.makeText(this, "Haven Engine Starting...", Toast.LENGTH_SHORT).show()
-        } catch (e: Exception) {
-            Toast.makeText(this, "Service Start Error: " + e.message, Toast.LENGTH_LONG).show()
-        }
-    }
-
-    companion object {
-        private const val KEY_DRIVE_EXPORT_URI = "drive_export_uri"
-    }
-}
+            withContext(Dispatchers
