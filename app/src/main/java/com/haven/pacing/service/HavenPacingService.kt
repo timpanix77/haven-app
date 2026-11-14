@@ -71,7 +71,11 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         startBleAutoConnect()
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_STICKY
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        evaluateRollover()
+        broadcastHud()
+        return START_STICKY
+    }
 
     override fun onBind(intent: Intent?): IBinder = binder
 
@@ -280,7 +284,10 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         evaluateRollover()
 
         currentHr = hr
-        if (hr > dailyPeakHr) dailyPeakHr = hr
+        if (hr > dailyPeakHr) {
+            dailyPeakHr = hr
+            prefs.edit().putInt(KEY_DAILY_PEAK_HR, dailyPeakHr).apply()
+        }
 
         val now = SystemClock.elapsedRealtime()
         val deltaSec = if (lastTickMs == 0L) 1.0 else (now - lastTickMs) / 1000.0
@@ -294,6 +301,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
             }
             val durMs = now - excursionStartMs
             excursionDurationSec = durMs / 1000L
+            prefs.edit().putLong(KEY_LAST_EXCURSION_SEC, excursionDurationSec).apply()
 
             if (durMs > graceMs) {
                 val rate = when {
@@ -324,6 +332,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
                 inExcursion = false
                 excursionDurationSec = (now - excursionStartMs) / 1000L
                 excursionBurn = 0.0
+                prefs.edit().putLong(KEY_LAST_EXCURSION_SEC, excursionDurationSec).apply()
             }
         }
 
@@ -396,7 +405,12 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
             dailyPeakHr = currentHr
             excursionDurationSec = 0L
             inExcursion = false
-            prefs.edit().putString(KEY_POINTS_DATE, today).putFloat(KEY_DAILY_BURN, 0f).apply()
+            prefs.edit()
+                .putString(KEY_POINTS_DATE, today)
+                .putFloat(KEY_DAILY_BURN, 0f)
+                .putInt(KEY_DAILY_PEAK_HR, currentHr)
+                .putLong(KEY_LAST_EXCURSION_SEC, 0L)
+                .apply()
             fetchMorningHrv()
         } else {
             dailyBurn = prefs.getFloat(KEY_DAILY_BURN, 0f).toDouble()
@@ -405,6 +419,11 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
             graceMs = prefs.getLong(KEY_GRACE_MS, DEFAULT_GRACE_BUFFER_MS)
             morningHrv = prefs.getFloat(KEY_MORNING_HRV, BASELINE_HRV_RMSSD.toFloat()).toDouble()
             stability = prefs.getInt(KEY_STABILITY, 75)
+            val savedPeak = prefs.getInt(KEY_DAILY_PEAK_HR, 0)
+            if (savedPeak > dailyPeakHr) dailyPeakHr = savedPeak
+            if (!inExcursion) {
+                excursionDurationSec = prefs.getLong(KEY_LAST_EXCURSION_SEC, 0L)
+            }
         }
     }
 
@@ -413,7 +432,9 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
     private fun broadcastHud() {
         val intent = Intent(ACTION_HUD_UPDATE).apply {
             putExtra(EXTRA_HR, currentHr)
-            putExtra(EXTRA_EXCURSION_SEC, if (inExcursion) excursionDurationSec.toInt() else 0)
+            putExtra(EXTRA_EXCURSION_SEC, excursionDurationSec.toInt())
+            putExtra(EXTRA_IN_EXCURSION, inExcursion)
+            putExtra(EXTRA_GRACE_SEC, (graceMs / 1000L).toInt())
             putExtra(EXTRA_PEAK_HR, dailyPeakHr)
             putExtra(EXTRA_DAILY_POINTS, dailyBurn)
             putExtra(EXTRA_BUDGET_POINTS, budgetCap)
@@ -468,7 +489,6 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         const val PREFS_NAME = "haven_pacing_prefs"
 
         var isServiceRunning = false
-        var onTelemetryUpdate: ((hr: Int, excSec: Int, totalSec: Int, mode: String) -> Unit)? = null
 
         const val BASE_DAILY_BUDGET = 20.0
         const val DEFAULT_CEILING_BPM = 88
@@ -483,10 +503,14 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         const val KEY_GRACE_MS = "grace_ms"
         const val KEY_STABILITY = "stability"
         const val KEY_SAVED_DEVICE_ADDR = "saved_device_addr"
+        const val KEY_DAILY_PEAK_HR = "daily_peak_hr"
+        const val KEY_LAST_EXCURSION_SEC = "last_excursion_sec"
 
         const val ACTION_HUD_UPDATE = "com.haven.pacing.ACTION_HUD_UPDATE"
         const val EXTRA_HR = "extra_hr"
         const val EXTRA_EXCURSION_SEC = "extra_excursion_sec"
+        const val EXTRA_IN_EXCURSION = "extra_in_excursion"
+        const val EXTRA_GRACE_SEC = "extra_grace_sec"
         const val EXTRA_PEAK_HR = "extra_peak_hr"
         const val EXTRA_DAILY_POINTS = "extra_daily_points"
         const val EXTRA_BUDGET_POINTS = "extra_budget_points"
