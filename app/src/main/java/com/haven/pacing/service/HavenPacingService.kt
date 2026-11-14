@@ -12,6 +12,8 @@ import androidx.health.connect.client.HealthConnectClient
 import androidx.health.connect.client.records.HeartRateVariabilityRmssdRecord
 import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.time.TimeRangeFilter
+import com.haven.pacing.data.ExcursionRecord
+import com.haven.pacing.data.HavenDatabase
 import kotlinx.coroutines.*
 import java.text.SimpleDateFormat
 import java.time.Instant
@@ -48,6 +50,8 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
     // Excursion State Tracking
     private var inExcursion = false
     private var excursionStartMs = 0L
+    private var excursionWallStartMs = 0L
+    private var excursionPeakHr = 0
     private var excursionDurationSec = 0L
     private var lastTickMs = 0L
     private var lastAlertMs = 0L
@@ -297,8 +301,13 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
             if (!inExcursion) {
                 inExcursion = true
                 excursionStartMs = now
+                excursionWallStartMs = System.currentTimeMillis()
+                excursionPeakHr = hr
                 excursionBurn = 0.0
+            } else if (hr > excursionPeakHr) {
+                excursionPeakHr = hr
             }
+
             val durMs = now - excursionStartMs
             excursionDurationSec = durMs / 1000L
             prefs.edit().putLong(KEY_LAST_EXCURSION_SEC, excursionDurationSec).apply()
@@ -330,9 +339,30 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         } else {
             if (inExcursion) {
                 inExcursion = false
-                excursionDurationSec = (now - excursionStartMs) / 1000L
+                val finalDurSec = ((now - excursionStartMs) / 1000L).toInt().coerceAtLeast(1)
+                val finalPeak = excursionPeakHr.coerceAtLeast(hr)
+                val finalBurn = Math.round(excursionBurn * 100.0) / 100.0
+                val wallStart = if (excursionWallStartMs > 0L) excursionWallStartMs else System.currentTimeMillis()
+
+                excursionDurationSec = finalDurSec.toLong()
                 excursionBurn = 0.0
+                excursionPeakHr = 0
                 prefs.edit().putLong(KEY_LAST_EXCURSION_SEC, excursionDurationSec).apply()
+
+                if (finalDurSec >= 5) {
+                    val record = ExcursionRecord(
+                        timestamp = wallStart,
+                        durationSeconds = finalDurSec,
+                        peakHr = finalPeak,
+                        settledHr = hr,
+                        strainPoints = finalBurn
+                    )
+                    scope.launch(Dispatchers.IO) {
+                        try {
+                            HavenDatabase.getDatabase(applicationContext).havenDao().insert(record)
+                        } catch (_: Exception) { }
+                    }
+                }
             }
         }
 
