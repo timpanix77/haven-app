@@ -47,7 +47,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
     private var stability = 75
     private var bleStatus = "BLE: READY"
 
-    // Excursion State Tracking
+    // Excursion & Sensor Watchdog State
     private var inExcursion = false
     private var excursionStartMs = 0L
     private var excursionWallStartMs = 0L
@@ -55,6 +55,10 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
     private var excursionDurationSec = 0L
     private var lastTickMs = 0L
     private var lastAlertMs = 0L
+
+    private var lastPacketElapsedMs = 0L
+    private var lastChangedBpm = 0
+    private var lastBpmChangeElapsedMs = 0L
 
     inner class LocalBinder : Binder() {
         fun getService(): HavenPacingService = this@HavenPacingService
@@ -72,10 +76,16 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
 
         evaluateRollover()
         fetchMorningHrv()
+        startTelemetryWatchdog()
         startBleAutoConnect()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_STOP_TTS) {
+            tts?.stop()
+            abandonDucking()
+            return START_STICKY
+        }
         evaluateRollover()
         broadcastHud()
         return START_STICKY
@@ -93,7 +103,46 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         super.onDestroy()
     }
 
-    // --- Audio Focus Ducker & British TTS Engine ---
+    // --- 1-Second Watchdog: Catches Silent BLE Dropouts & Frozen HR Sensors ---
+
+    private fun startTelemetryWatchdog() {
+        scope.launch {
+            while (isActive) {
+                delay(1_000L)
+                checkSignalFreshness()
+            }
+        }
+    }
+
+    @Synchronized
+    private fun checkSignalFreshness() {
+        if (currentHr <= 0) return
+        val now = SystemClock.elapsedRealtime()
+        val packetAgeMs = now - lastPacketElapsedMs
+        val frozenAgeMs = now - lastBpmChangeElapsedMs
+
+        val bleTimedOut = lastPacketElapsedMs > 0L && packetAgeMs > BLE_PACKET_TIMEOUT_MS
+        val sensorFrozen = lastBpmChangeElapsedMs > 0L && frozenAgeMs > FROZEN_HR_TIMEOUT_MS
+
+        if (bleTimedOut || sensorFrozen) {
+            closeActiveExcursion(now, currentHr)
+            currentHr = 0
+            lastTickMs = 0L
+            lastChangedBpm = 0
+            bleStatus = if (sensorFrozen) {
+                "BLE: SENSOR FROZEN (5m TIMEOUT)"
+            } else {
+                "BLE: SIGNAL LOST (15s TIMEOUT)"
+            }
+            updateNotification()
+            broadcastHud()
+            if (bleTimedOut && !isScanning) {
+                startBleAutoConnect()
+            }
+        }
+    }
+
+    // --- 3-Way Alert Router (VOX / VIBRATE / SILENCE) ---
 
     private fun initTts() {
         tts = TextToSpeech(this, this)
@@ -150,12 +199,39 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
+    private fun triggerAlertVibration() {
+        @Suppress("DEPRECATION")
+        val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator ?: return
+        val pattern = longArrayOf(0L, 180L, 120L, 180L)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            vibrator.vibrate(VibrationEffect.createWaveform(pattern, -1))
+        } else {
+            @Suppress("DEPRECATION")
+            vibrator.vibrate(pattern, -1)
+        }
+    }
+
     private fun speakAlert(message: String) {
-        if (!ttsReady) return
-        requestDucking()
-        val params = Bundle()
-        params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, "HAVEN_ALERT")
-        tts?.speak(message, TextToSpeech.QUEUE_FLUSH, params, "HAVEN_ALERT")
+        val mode = prefs.getString(KEY_ALERT_MODE, ALERT_MODE_VOX) ?: ALERT_MODE_VOX
+        when (mode) {
+            ALERT_MODE_SILENCE -> {
+                tts?.stop()
+                abandonDucking()
+            }
+            ALERT_MODE_VIBRATE -> {
+                tts?.stop()
+                abandonDucking()
+                triggerAlertVibration()
+            }
+            else -> {
+                triggerAlertVibration()
+                if (!ttsReady) return
+                requestDucking()
+                val params = Bundle()
+                params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, "HAVEN_ALERT")
+                tts?.speak(message, TextToSpeech.QUEUE_FLUSH, params, "HAVEN_ALERT")
+            }
+        }
     }
 
     // --- BLE Telemetry Ingress & Auto-Discovery ---
@@ -234,7 +310,9 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
                 try { g.discoverServices() } catch (_: SecurityException) { }
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                 isConnected = false
+                closeActiveExcursion(SystemClock.elapsedRealtime(), 0)
                 currentHr = 0
+                lastTickMs = 0L
                 bleStatus = "BLE: DISCONNECTED"
                 broadcastHud()
                 startBleAutoConnect()
@@ -262,20 +340,31 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         @Deprecated("Android 12 compatibility")
         override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic) {
             if (c.uuid == UUID_HR_MEASURE) {
-                val format = if ((c.getIntValue(BluetoothGattCharacteristic.FORMAT_UINT8, 0) and 0x01) != 0) {
+                val flags = c.getIntValue(BluetoothGattCharacteristic.FORMAT_UINT8, 0) ?: 0
+                val contactSupported = (flags and 0x04) != 0
+                val sensorInContact = (flags and 0x02) != 0
+                val format = if ((flags and 0x01) != 0) {
                     BluetoothGattCharacteristic.FORMAT_UINT16
                 } else {
                     BluetoothGattCharacteristic.FORMAT_UINT8
                 }
-                parseHr(c.getIntValue(format, 1) ?: 0)
+                val hr = c.getIntValue(format, 1) ?: 0
+                parseHr(hr, contactSupported && !sensorInContact)
             }
         }
 
         override fun onCharacteristicChanged(g: BluetoothGatt, c: BluetoothGattCharacteristic, value: ByteArray) {
-            if (c.uuid == UUID_HR_MEASURE) {
-                val is16 = (value[0].toInt() and 0x01) != 0
-                val hr = if (is16) ((value[2].toInt() and 0xFF) shl 8) or (value[1].toInt() and 0xFF) else value[1].toInt() and 0xFF
-                parseHr(hr)
+            if (c.uuid == UUID_HR_MEASURE && value.size >= 2) {
+                val flags = value[0].toInt() and 0xFF
+                val contactSupported = (flags and 0x04) != 0
+                val sensorInContact = (flags and 0x02) != 0
+                val is16 = (flags and 0x01) != 0
+                val hr = if (is16 && value.size >= 3) {
+                    ((value[2].toInt() and 0xFF) shl 8) or (value[1].toInt() and 0xFF)
+                } else {
+                    value[1].toInt() and 0xFF
+                }
+                parseHr(hr, contactSupported && !sensorInContact)
             }
         }
     }
@@ -283,18 +372,47 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
     // --- Pacing Engine & Math Model ---
 
     @Synchronized
-    private fun parseHr(hr: Int) {
-        if (hr <= 0) return
+    private fun parseHr(hr: Int, isOffWrist: Boolean = false) {
+        val now = SystemClock.elapsedRealtime()
         evaluateRollover()
 
+        // Reject off-wrist optical charger noise or invalid zero packets
+        if (isOffWrist || hr <= 0) {
+            closeActiveExcursion(now, 0)
+            currentHr = 0
+            lastTickMs = 0L
+            lastChangedBpm = 0
+            bleStatus = if (isOffWrist) "BLE: OFF-WRIST (STANDBY)" else "BLE: WAITING FOR PULSE"
+            updateNotification()
+            broadcastHud()
+            return
+        }
+
+        lastPacketElapsedMs = now
+        if (hr != lastChangedBpm) {
+            lastChangedBpm = hr
+            lastBpmChangeElapsedMs = now
+        } else if (lastBpmChangeElapsedMs > 0L && (now - lastBpmChangeElapsedMs) > FROZEN_HR_TIMEOUT_MS) {
+            // Watch is still transmitting the exact same frozen HR past 5 minutes — ignore until value changes
+            closeActiveExcursion(now, 0)
+            currentHr = 0
+            lastTickMs = 0L
+            bleStatus = "BLE: SENSOR FROZEN (5m TIMEOUT)"
+            updateNotification()
+            broadcastHud()
+            return
+        }
+
+        bleStatus = "BLE: CONNECTED"
         currentHr = hr
         if (hr > dailyPeakHr) {
             dailyPeakHr = hr
             prefs.edit().putInt(KEY_DAILY_PEAK_HR, dailyPeakHr).apply()
         }
 
-        val now = SystemClock.elapsedRealtime()
-        val deltaSec = if (lastTickMs == 0L) 1.0 else (now - lastTickMs) / 1000.0
+        // Never backfill strain across disconnect/charging gaps (> 5 seconds)
+        val rawDeltaSec = if (lastTickMs == 0L) 1.0 else (now - lastTickMs) / 1000.0
+        val deltaSec = rawDeltaSec.coerceIn(0.0, MAX_PACKET_DELTA_SEC)
         lastTickMs = now
 
         if (hr >= activeCeiling) {
@@ -337,37 +455,40 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
                 }
             }
         } else {
-            if (inExcursion) {
-                inExcursion = false
-                val finalDurSec = ((now - excursionStartMs) / 1000L).toInt().coerceAtLeast(1)
-                val finalPeak = excursionPeakHr.coerceAtLeast(hr)
-                val finalBurn = Math.round(excursionBurn * 100.0) / 100.0
-                val wallStart = if (excursionWallStartMs > 0L) excursionWallStartMs else System.currentTimeMillis()
-
-                excursionDurationSec = finalDurSec.toLong()
-                excursionBurn = 0.0
-                excursionPeakHr = 0
-                prefs.edit().putLong(KEY_LAST_EXCURSION_SEC, excursionDurationSec).apply()
-
-                if (finalDurSec >= 5) {
-                    val record = ExcursionRecord(
-                        timestamp = wallStart,
-                        durationSeconds = finalDurSec,
-                        peakHr = finalPeak,
-                        settledHr = hr,
-                        strainPoints = finalBurn
-                    )
-                    scope.launch(Dispatchers.IO) {
-                        try {
-                            HavenDatabase.getDatabase(applicationContext).havenDao().insert(record)
-                        } catch (_: Exception) { }
-                    }
-                }
-            }
+            closeActiveExcursion(now, hr)
         }
 
         updateNotification()
         broadcastHud()
+    }
+
+    private fun closeActiveExcursion(nowElapsedMs: Long, settledHr: Int) {
+        if (!inExcursion) return
+        inExcursion = false
+        val finalDurSec = ((nowElapsedMs - excursionStartMs) / 1000L).toInt().coerceAtLeast(1)
+        val finalPeak = excursionPeakHr.coerceAtLeast(settledHr)
+        val finalBurn = Math.round(excursionBurn * 100.0) / 100.0
+        val wallStart = if (excursionWallStartMs > 0L) excursionWallStartMs else System.currentTimeMillis()
+
+        excursionDurationSec = finalDurSec.toLong()
+        excursionBurn = 0.0
+        excursionPeakHr = 0
+        prefs.edit().putLong(KEY_LAST_EXCURSION_SEC, excursionDurationSec).apply()
+
+        if (finalDurSec >= 5 && finalBurn > 0.0) {
+            val record = ExcursionRecord(
+                timestamp = wallStart,
+                durationSeconds = finalDurSec,
+                peakHr = finalPeak,
+                settledHr = settledHr,
+                strainPoints = finalBurn
+            )
+            scope.launch(Dispatchers.IO) {
+                try {
+                    HavenDatabase.getDatabase(applicationContext).havenDao().insert(record)
+                } catch (_: Exception) { }
+            }
+        }
     }
 
     // --- Automated HRV Capacity Governor ---
@@ -505,10 +626,10 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
 
     private fun updateNotification() {
         val rem = budgetCap - dailyBurn
-        val txt = if (inExcursion) {
-            "EXCURSION: $currentHr BPM | REMAIN: ${String.format(Locale.US, "%.1f", rem)} PTS"
-        } else {
-            "PULSE: $currentHr BPM | PEAK: $dailyPeakHr | REMAIN: ${String.format(Locale.US, "%.1f", rem)} PTS"
+        val txt = when {
+            currentHr <= 0 -> "$bleStatus | REMAIN: ${String.format(Locale.US, "%.1f", rem)} PTS"
+            inExcursion -> "EXCURSION: $currentHr BPM | REMAIN: ${String.format(Locale.US, "%.1f", rem)} PTS"
+            else -> "PULSE: $currentHr BPM | PEAK: $dailyPeakHr | REMAIN: ${String.format(Locale.US, "%.1f", rem)} PTS"
         }
         (getSystemService(Context.NOTIFICATION_SERVICE) as? NotificationManager)?.notify(NOTIFICATION_ID, buildNotification(txt))
     }
@@ -524,6 +645,16 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         const val DEFAULT_CEILING_BPM = 88
         const val DEFAULT_GRACE_BUFFER_MS = 120_000L
         const val BASELINE_HRV_RMSSD = 50.0
+
+        const val BLE_PACKET_TIMEOUT_MS = 15_000L
+        const val FROZEN_HR_TIMEOUT_MS = 300_000L // 5 minutes
+        const val MAX_PACKET_DELTA_SEC = 5.0
+
+        const val ALERT_MODE_VOX = "VOX"
+        const val ALERT_MODE_VIBRATE = "VIBRATE"
+        const val ALERT_MODE_SILENCE = "SILENCE"
+        const val KEY_ALERT_MODE = "alert_mode"
+        const val ACTION_STOP_TTS = "com.haven.pacing.ACTION_STOP_TTS"
 
         const val KEY_DAILY_BURN = "daily_burned"
         const val KEY_BUDGET_CAP = "budget_cap"
