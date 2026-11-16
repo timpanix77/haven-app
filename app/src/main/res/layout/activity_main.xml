@@ -4,7 +4,7 @@
     android:layout_height="match_parent"
     android:background="#0A0A0A"
     android:orientation="vertical"
-    android:padding="20dp">
+    android:padding="18dp">
 
     <!-- AVIONICS HEADER -->
     <TextView
@@ -33,7 +33,7 @@
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="16dp"
+        android:layout_marginTop="12dp"
         android:gravity="center"
         android:orientation="vertical">
 
@@ -52,7 +52,7 @@
             android:layout_height="wrap_content"
             android:text="--"
             android:textColor="#FFFFFF"
-            android:textSize="72sp"
+            android:textSize="68sp"
             android:textStyle="bold"
             android:fontFamily="monospace" />
 
@@ -70,7 +70,7 @@
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="16dp"
+        android:layout_marginTop="12dp"
         android:orientation="vertical">
 
         <LinearLayout
@@ -106,7 +106,7 @@
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="12dp"
+        android:layout_marginTop="10dp"
         android:orientation="vertical">
 
         <LinearLayout
@@ -143,7 +143,7 @@
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="12dp"
+        android:layout_marginTop="10dp"
         android:orientation="vertical">
 
         <LinearLayout
@@ -179,10 +179,10 @@
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="16dp"
+        android:layout_marginTop="12dp"
         android:background="#161618"
         android:orientation="horizontal"
-        android:padding="12dp">
+        android:padding="10dp">
 
         <LinearLayout
             android:layout_width="0dp"
@@ -245,21 +245,32 @@
         android:id="@+id/tvStabilityBanner"
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="12dp"
+        android:layout_marginTop="10dp"
         android:background="#161618"
         android:gravity="center"
-        android:padding="10dp"
+        android:padding="9dp"
         android:text="STABILITY: 75/100 [STABLE] | CEIL: 88 | BUD: 20m"
         android:textColor="#00E676"
         android:textSize="11sp"
+        android:fontFamily="monospace" />
+
+    <!-- 3-WAY ALERT MODE TOGGLE (VOX / VIBRATE / SILENCE) -->
+    <Button
+        android:id="@+id/btnAlertMode"
+        android:layout_width="match_parent"
+        android:layout_height="44dp"
+        android:layout_marginTop="12dp"
+        android:backgroundTint="#1C1C1E"
+        android:text="ALERT: VOX"
+        android:textColor="#00E676"
         android:fontFamily="monospace" />
 
     <!-- CONTROLS & VAULT FOOTER -->
     <Button
         android:id="@+id/btnArm"
         android:layout_width="match_parent"
-        android:layout_height="48dp"
-        android:layout_marginTop="16dp"
+        android:layout_height="44dp"
+        android:layout_marginTop="6dp"
         android:backgroundTint="#1C1C1E"
         android:text="ENGINE ACTIVE (ARMED)"
         android:textColor="#00E676"
@@ -268,13 +279,13 @@
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
-        android:layout_marginTop="8dp"
+        android:layout_marginTop="6dp"
         android:orientation="horizontal">
 
         <Button
             android:id="@+id/btnExport"
             android:layout_width="0dp"
-            android:layout_height="44dp"
+            android:layout_height="42dp"
             android:layout_marginEnd="4dp"
             android:layout_weight="1"
             android:backgroundTint="#161618"
@@ -286,7 +297,7 @@
         <Button
             android:id="@+id/btnRestore"
             android:layout_width="0dp"
-            android:layout_height="44dp"
+            android:layout_height="42dp"
             android:layout_marginStart="4dp"
             android:layout_weight="1"
             android:backgroundTint="#161618"
