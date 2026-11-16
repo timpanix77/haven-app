@@ -15,11 +15,12 @@
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
 
-    <!-- Foreground Telemetry Service & Notifications -->
+    <!-- Foreground Telemetry Service, Haptics & Notifications -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.VIBRATE" />
 
     <!-- Health Connect Read Permissions (Overnight HRV & Resting HR) -->
     <uses-permission android:name="android.permission.health.READ_HEART_RATE_VARIABILITY" />
@@ -30,8 +31,10 @@
     </queries>
 
     <application
-        android:allowBackup="true"
-        android:icon="@android:drawable/sym_def_app_icon"
+        android:allowBackup="false"
+        tools:replace="android:allowBackup"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
         android:label="HAVEN"
         android:supportsRtl="true"
         android:theme="@style/Theme.AppCompat.NoActionBar">
