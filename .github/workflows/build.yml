@@ -12,6 +12,84 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Generate Native 1x1 Launcher Icons
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq python3-pil
+          python3 - << 'PYEOF'
+          import os, glob
+          from PIL import Image, ImageDraw
+
+          res_dir = "app/src/main/res"
+          os.makedirs(res_dir, exist_ok=True)
+
+          # Remove any legacy adaptive icon XMLs so our generated assets take priority
+          for old in glob.glob(os.path.join(res_dir, "mipmap-*", "ic_launcher*.xml")):
+              os.remove(old)
+
+          candidates = ["haven_icon.png", "haven_icon.jpg", "haven_icon.jpeg"]
+          src_path = next((p for p in candidates if os.path.exists(p)), None)
+
+          if src_path:
+              im = Image.open(src_path).convert("RGBA")
+              w, h = im.size
+              side = min(w, h)
+              left = (w - side) // 2
+              top = (h - side) // 2
+              base = im.crop((left, top, left + side, top + side)).resize((1024, 1024), Image.LANCZOS)
+          else:
+              # Clean obsidian & cyan H fallback if haven_icon.png isn't uploaded yet
+              base = Image.new("RGBA", (1024, 1024), (11, 15, 23, 255))
+              draw = ImageDraw.Draw(base)
+              cyan = (0, 229, 255, 255)
+              red = (255, 82, 82, 255)
+              draw.rectangle([300, 270, 395, 754], fill=cyan)
+              draw.rectangle([629, 270, 724, 754], fill=cyan)
+              draw.rectangle([300, 468, 724, 556], fill=cyan)
+              draw.line([(160, 512), (280, 512)], fill=cyan, width=14)
+              draw.line([(744, 512), (785, 512), (805, 430), (830, 595), (855, 480), (880, 512), (915, 512)], fill=cyan, width=14)
+              draw.line([(415, 260), (455, 290), (495, 165), (535, 275), (565, 225), (605, 265)], fill=red, width=14)
+
+          densities = {
+              "mipmap-mdpi": 48,
+              "mipmap-hdpi": 72,
+              "mipmap-xhdpi": 96,
+              "mipmap-xxhdpi": 144,
+              "mipmap-xxxhdpi": 192,
+          }
+
+          for folder, px in densities.items():
+              out_dir = os.path.join(res_dir, folder)
+              os.makedirs(out_dir, exist_ok=True)
+              icon_sq = base.resize((px, px), Image.LANCZOS).convert("RGB")
+              icon_sq.save(os.path.join(out_dir, "ic_launcher.png"), "PNG")
+              icon_sq.save(os.path.join(out_dir, "ic_launcher_round.png"), "PNG")
+
+              # Adaptive foreground padded to 72% inside 108dp canvas so Samsung squircle never clips the H
+              fg_px = int(px * 2.25)
+              fg_canvas = Image.new("RGBA", (fg_px, fg_px), (0, 0, 0, 0))
+              inner = int(fg_px * 0.72)
+              offset = (fg_px - inner) // 2
+              fg_canvas.paste(base.resize((inner, inner), Image.LANCZOS), (offset, offset))
+              fg_canvas.save(os.path.join(out_dir, "ic_launcher_foreground.png"), "PNG")
+
+          values_dir = os.path.join(res_dir, "values")
+          os.makedirs(values_dir, exist_ok=True)
+          with open(os.path.join(values_dir, "ic_launcher_background.xml"), "w") as f:
+              f.write('<?xml version="1.0" encoding="utf-8"?>\n<resources>\n    <color name="ic_launcher_background">#0B0F17</color>\n</resources>\n')
+
+          anydpi_dir = os.path.join(res_dir, "mipmap-anydpi-v26")
+          os.makedirs(anydpi_dir, exist_ok=True)
+          adaptive_xml = '''<?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@color/ic_launcher_background" />
+              <foreground android:drawable="@mipmap/ic_launcher_foreground" />
+          </adaptive-icon>
+          '''
+          for name in ("ic_launcher.xml", "ic_launcher_round.xml"):
+              with open(os.path.join(anydpi_dir, name), "w") as f:
+                  f.write(adaptive_xml)
+          PYEOF
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
