@@ -11,6 +11,8 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
@@ -54,6 +56,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvBufferStatus: TextView
     private lateinit var tvPeakIndicator: TextView
     private lateinit var tvStabilityBanner: TextView
+    private lateinit var btnAlertMode: Button
     private lateinit var btnArm: Button
     private lateinit var btnExport: Button
     private lateinit var btnRestore: Button
@@ -155,6 +158,7 @@ class MainActivity : AppCompatActivity() {
         tvBufferStatus = findViewById(R.id.tvBufferStatus)
         tvPeakIndicator = findViewById(R.id.tvPeakIndicator)
         tvStabilityBanner = findViewById(R.id.tvStabilityBanner)
+        btnAlertMode = findViewById(R.id.btnAlertMode)
         btnArm = findViewById(R.id.btnArm)
         btnExport = findViewById(R.id.btnExport)
         btnRestore = findViewById(R.id.btnRestore)
@@ -168,6 +172,8 @@ class MainActivity : AppCompatActivity() {
         vuGrace.meterType = LedVuMeterView.MeterType.GRACE_BUFFER
 
         vaultManager = VaultManager(HavenDatabase.getDatabase(this))
+
+        setupAlertModeToggle()
 
         btnArm.setOnClickListener {
             Toast.makeText(this, "Checking BLE & Permissions...", Toast.LENGTH_SHORT).show()
@@ -230,6 +236,59 @@ class MainActivity : AppCompatActivity() {
 
         renderTelemetry(0, 0, false, 0, 0.0, 20.0, 0.0, 75, 88, 120, "COCKPIT_LIVE", "BLE: READY - TAP 'ARM' TO START")
         checkPermissionsAndStartService()
+    }
+
+    private fun setupAlertModeToggle() {
+        val prefs = getSharedPreferences(HavenPacingService.PREFS_NAME, Context.MODE_PRIVATE)
+        var currentMode = prefs.getString(HavenPacingService.KEY_ALERT_MODE, HavenPacingService.ALERT_MODE_VOX)
+            ?: HavenPacingService.ALERT_MODE_VOX
+        renderAlertModeButton(currentMode)
+
+        btnAlertMode.setOnClickListener {
+            currentMode = when (currentMode) {
+                HavenPacingService.ALERT_MODE_VOX -> HavenPacingService.ALERT_MODE_VIBRATE
+                HavenPacingService.ALERT_MODE_VIBRATE -> HavenPacingService.ALERT_MODE_SILENCE
+                else -> HavenPacingService.ALERT_MODE_VOX
+            }
+            prefs.edit().putString(HavenPacingService.KEY_ALERT_MODE, currentMode).apply()
+            renderAlertModeButton(currentMode)
+
+            if (currentMode != HavenPacingService.ALERT_MODE_VOX) {
+                try {
+                    startService(Intent(this, HavenPacingService::class.java).apply {
+                        action = HavenPacingService.ACTION_STOP_TTS
+                    })
+                } catch (_: Exception) { }
+            }
+
+            if (currentMode == HavenPacingService.ALERT_MODE_VIBRATE) {
+                @Suppress("DEPRECATION")
+                val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    vibrator?.vibrate(VibrationEffect.createOneShot(60L, VibrationEffect.DEFAULT_AMPLITUDE))
+                } else {
+                    @Suppress("DEPRECATION")
+                    vibrator?.vibrate(60L)
+                }
+            }
+        }
+    }
+
+    private fun renderAlertModeButton(mode: String) {
+        when (mode) {
+            HavenPacingService.ALERT_MODE_VIBRATE -> {
+                btnAlertMode.text = "ALERT: VIBRATE"
+                btnAlertMode.setTextColor(Color.parseColor("#FF9100"))
+            }
+            HavenPacingService.ALERT_MODE_SILENCE -> {
+                btnAlertMode.text = "ALERT: SILENCE"
+                btnAlertMode.setTextColor(Color.parseColor("#8E8E93"))
+            }
+            else -> {
+                btnAlertMode.text = "ALERT: VOX"
+                btnAlertMode.setTextColor(Color.parseColor("#00E676"))
+            }
+        }
     }
 
     private fun runFullVaultExport() {
@@ -451,6 +510,11 @@ class MainActivity : AppCompatActivity() {
 
     override fun onResume() {
         super.onResume()
+        val prefs = getSharedPreferences(HavenPacingService.PREFS_NAME, Context.MODE_PRIVATE)
+        val savedAlertMode = prefs.getString(HavenPacingService.KEY_ALERT_MODE, HavenPacingService.ALERT_MODE_VOX)
+            ?: HavenPacingService.ALERT_MODE_VOX
+        renderAlertModeButton(savedAlertMode)
+
         val filter = IntentFilter(HavenPacingService.ACTION_HUD_UPDATE)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(hudReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
@@ -515,6 +579,7 @@ class MainActivity : AppCompatActivity() {
         } else {
             tvLiveHr.text = "--"
             tvLiveHr.setTextColor(Color.parseColor("#8E8E93"))
+            vuHr.setLevel(0f, 70f)
             tvHrStatus.text = if (bleStatus.isNotEmpty()) bleStatus else "BLE: SEARCHING..."
         }
 
