@@ -41,11 +41,15 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
     private var activeCeiling = DEFAULT_CEILING_BPM
     private var graceMs = DEFAULT_GRACE_BUFFER_MS
     private var budgetCap = BASE_DAILY_BUDGET
+    private var postureMultiplier = POSTURE_RECLINED // Safe default 0.20x until set upright/seated
     private var dailyBurn = 0.0
     private var excursionBurn = 0.0
     private var morningHrv = BASELINE_HRV_RMSSD
     private var stability = 75
     private var bleStatus = "BLE: READY"
+
+    // 3-Sample Rolling Window to Reject Optical Wrist Artifacts
+    private val hrWindow = ArrayDeque<Int>(3)
 
     // Excursion & Sensor Watchdog State
     private var inExcursion = false
@@ -81,10 +85,24 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_STOP_TTS) {
-            tts?.stop()
-            abandonDucking()
-            return START_STICKY
+        when (intent?.action) {
+            ACTION_STOP_TTS -> {
+                tts?.stop()
+                abandonDucking()
+                return START_STICKY
+            }
+            ACTION_SET_POSTURE -> {
+                val mult = intent.getDoubleExtra(EXTRA_POSTURE_MULT, POSTURE_RECLINED)
+                postureMultiplier = mult.coerceIn(0.20, 1.00)
+                prefs.edit().putFloat(KEY_POSTURE_MULT, postureMultiplier.toFloat()).apply()
+                updateNotification()
+                broadcastHud()
+                return START_STICKY
+            }
+            ACTION_TEST_ALERT -> {
+                speakAlert("HAVEN voice alert check. Audio routing active.")
+                return START_STICKY
+            }
         }
         evaluateRollover()
         broadcastHud()
@@ -127,6 +145,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         if (bleTimedOut || sensorFrozen) {
             closeActiveExcursion(now, currentHr)
             currentHr = 0
+            hrWindow.clear()
             lastTickMs = 0L
             lastChangedBpm = 0
             bleStatus = if (sensorFrozen) {
@@ -142,40 +161,46 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
-    // --- 3-Way Alert Router (VOX / VIBRATE / SILENCE) ---
+    // --- Bulletproof 3-Way Alert Router (VOX + Alarm-Stream Fallback / VIBRATE / SILENCE) ---
 
     private fun initTts() {
+        ttsReady = false
+        tts?.shutdown()
         tts = TextToSpeech(this, this)
     }
 
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
-            val sysVoice = tts?.defaultVoice
-            if (sysVoice != null && sysVoice.locale.language == Locale.UK.language && sysVoice.locale.country == Locale.UK.country) {
-                tts?.voice = sysVoice
-            } else {
-                tts?.language = Locale.UK
+            val langResult = tts?.setLanguage(Locale.UK) ?: TextToSpeech.LANG_NOT_SUPPORTED
+            if (langResult == TextToSpeech.LANG_MISSING_DATA || langResult == TextToSpeech.LANG_NOT_SUPPORTED) {
+                tts?.setLanguage(Locale.US)
             }
 
+            // Route through USAGE_ALARM so media-volume mute or Doze never swallows pacing warnings
             tts?.setAudioAttributes(
                 AudioAttributes.Builder()
-                    .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+                    .setUsage(AudioAttributes.USAGE_ALARM)
                     .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                     .build()
             )
             tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
                 override fun onStart(utteranceId: String?) {}
                 override fun onDone(utteranceId: String?) { abandonDucking() }
-                override fun onError(utteranceId: String?) { abandonDucking() }
+                override fun onError(utteranceId: String?) {
+                    abandonDucking()
+                    playFallbackTone()
+                }
             })
             ttsReady = true
+        } else {
+            ttsReady = false
         }
     }
 
     private fun requestDucking() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val attr = AudioAttributes.Builder()
-                .setUsage(AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE)
+                .setUsage(AudioAttributes.USAGE_ALARM)
                 .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
                 .build()
             audioFocusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
@@ -186,7 +211,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
             audioFocusRequest?.let { audioManager.requestAudioFocus(it) }
         } else {
             @Suppress("DEPRECATION")
-            audioManager.requestAudioFocus(null, AudioManager.STREAM_MUSIC, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
+            audioManager.requestAudioFocus(null, AudioManager.STREAM_ALARM, AudioManager.AUDIOFOCUS_GAIN_TRANSIENT_MAY_DUCK)
         }
     }
 
@@ -200,15 +225,31 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
     }
 
     private fun triggerAlertVibration() {
-        @Suppress("DEPRECATION")
-        val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator ?: return
-        val pattern = longArrayOf(0L, 180L, 120L, 180L)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            vibrator.vibrate(VibrationEffect.createWaveform(pattern, -1))
+        val pattern = longArrayOf(0L, 220L, 120L, 220L, 120L, 260L)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val vm = getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as? VibratorManager
+            vm?.defaultVibrator?.vibrate(VibrationEffect.createWaveform(pattern, -1))
         } else {
             @Suppress("DEPRECATION")
-            vibrator.vibrate(pattern, -1)
+            val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator ?: return
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator.vibrate(VibrationEffect.createWaveform(pattern, -1))
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator.vibrate(pattern, -1)
+            }
         }
+    }
+
+    private fun playFallbackTone() {
+        try {
+            val tg = ToneGenerator(AudioManager.STREAM_ALARM, 90)
+            tg.startTone(ToneGenerator.TONE_PROP_BEEP2, 450)
+            scope.launch {
+                delay(600L)
+                tg.release()
+            }
+        } catch (_: Exception) { }
     }
 
     private fun speakAlert(message: String) {
@@ -225,11 +266,22 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
             }
             else -> {
                 triggerAlertVibration()
-                if (!ttsReady) return
+                if (!ttsReady || tts == null) {
+                    playFallbackTone()
+                    initTts()
+                    return
+                }
                 requestDucking()
-                val params = Bundle()
-                params.putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, "HAVEN_ALERT")
-                tts?.speak(message, TextToSpeech.QUEUE_FLUSH, params, "HAVEN_ALERT")
+                val params = Bundle().apply {
+                    putInt(TextToSpeech.Engine.KEY_PARAM_STREAM, AudioManager.STREAM_ALARM)
+                    putString(TextToSpeech.Engine.KEY_PARAM_UTTERANCE_ID, "HAVEN_ALERT")
+                }
+                val result = tts?.speak(message, TextToSpeech.QUEUE_FLUSH, params, "HAVEN_ALERT")
+                if (result == TextToSpeech.ERROR) {
+                    abandonDucking()
+                    playFallbackTone()
+                    initTts()
+                }
             }
         }
     }
@@ -312,6 +364,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
                 isConnected = false
                 closeActiveExcursion(SystemClock.elapsedRealtime(), 0)
                 currentHr = 0
+                hrWindow.clear()
                 lastTickMs = 0L
                 bleStatus = "BLE: DISCONNECTED"
                 broadcastHud()
@@ -369,17 +422,28 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
+    // --- 3-Sample Median Optical Filter ---
+
+    private fun smoothHr(rawHr: Int): Int {
+        if (hrWindow.size >= 3) hrWindow.removeFirst()
+        hrWindow.addLast(rawHr)
+        if (hrWindow.size < 3) return rawHr
+        val sorted = hrWindow.sorted()
+        return sorted[1]
+    }
+
     // --- Pacing Engine & Math Model ---
 
     @Synchronized
-    private fun parseHr(hr: Int, isOffWrist: Boolean = false) {
+    private fun parseHr(rawHr: Int, isOffWrist: Boolean = false) {
         val now = SystemClock.elapsedRealtime()
         evaluateRollover()
 
-        // Reject off-wrist optical charger noise or invalid zero packets
-        if (isOffWrist || hr <= 0) {
+        // Reject off-wrist optical charger noise or invalid/implausible packets
+        if (isOffWrist || rawHr !in 35..220) {
             closeActiveExcursion(now, 0)
             currentHr = 0
+            hrWindow.clear()
             lastTickMs = 0L
             lastChangedBpm = 0
             bleStatus = if (isOffWrist) "BLE: OFF-WRIST (STANDBY)" else "BLE: WAITING FOR PULSE"
@@ -389,13 +453,13 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         }
 
         lastPacketElapsedMs = now
-        if (hr != lastChangedBpm) {
-            lastChangedBpm = hr
+        if (rawHr != lastChangedBpm) {
+            lastChangedBpm = rawHr
             lastBpmChangeElapsedMs = now
         } else if (lastBpmChangeElapsedMs > 0L && (now - lastBpmChangeElapsedMs) > FROZEN_HR_TIMEOUT_MS) {
-            // Watch is still transmitting the exact same frozen HR past 5 minutes — ignore until value changes
             closeActiveExcursion(now, 0)
             currentHr = 0
+            hrWindow.clear()
             lastTickMs = 0L
             bleStatus = "BLE: SENSOR FROZEN (5m TIMEOUT)"
             updateNotification()
@@ -403,8 +467,10 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
             return
         }
 
+        val hr = smoothHr(rawHr)
         bleStatus = "BLE: CONNECTED"
         currentHr = hr
+
         if (hr > dailyPeakHr) {
             dailyPeakHr = hr
             prefs.edit().putInt(KEY_DAILY_PEAK_HR, dailyPeakHr).apply()
@@ -415,7 +481,10 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         val deltaSec = rawDeltaSec.coerceIn(0.0, MAX_PACKET_DELTA_SEC)
         lastTickMs = now
 
-        if (hr >= activeCeiling) {
+        // Enforce ironclad >= 89 BPM strain floor so sub-ceiling drift cannot pre-arm grace buffer
+        val effectiveCeiling = activeCeiling.coerceAtLeast(DEFAULT_CEILING_BPM + 1)
+
+        if (hr >= effectiveCeiling) {
             if (!inExcursion) {
                 inExcursion = true
                 excursionStartMs = now
@@ -431,25 +500,25 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
             prefs.edit().putLong(KEY_LAST_EXCURSION_SEC, excursionDurationSec).apply()
 
             if (durMs > graceMs) {
-                val rate = when {
+                val baseRate = when {
                     hr < 89 -> 0.0
                     hr in 89..95 -> 0.12
                     hr in 96..105 -> 0.45
                     hr in 106..114 -> 1.20
                     else -> 2.40
                 }
-                val pts = (rate / 60.0) * deltaSec
+                val pts = (baseRate * postureMultiplier / 60.0) * deltaSec
                 dailyBurn += pts
                 excursionBurn += pts
                 prefs.edit().putFloat(KEY_DAILY_BURN, dailyBurn.toFloat()).apply()
 
                 if (now - lastAlertMs > 45_000L) {
                     lastAlertMs = now
-                    val remaining = budgetCap - dailyBurn
+                    val remaining = (budgetCap - dailyBurn).coerceAtLeast(0.0)
                     val msg = if (remaining <= 0.0) {
                         "Budget exhausted. Recline immediately."
                     } else {
-                        "Heart rate $currentHr."
+                        "Heart rate $currentHr. Remaining ${String.format(Locale.US, "%.1f", remaining)} points."
                     }
                     speakAlert(msg)
                 }
@@ -491,7 +560,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         }
     }
 
-    // --- Automated HRV Capacity Governor ---
+    // --- Automated HRV Capacity Governor (With Safe Floor Guardrails) ---
 
     private fun fetchMorningHrv() {
         scope.launch {
@@ -511,6 +580,8 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
     }
 
     private fun applyHrv(rmssd: Double) {
+        // Ignore corrupt/zero Health Connect readings
+        if (rmssd <= 5.0 || rmssd > 250.0) return
         morningHrv = rmssd
         when {
             rmssd >= 50.0 -> {
@@ -521,15 +592,16 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
             }
             rmssd >= 40.0 -> {
                 budgetCap = 14.0
-                activeCeiling = 84
-                graceMs = 60_000L
+                activeCeiling = 88
+                graceMs = 120_000L
                 stability = 65
             }
             else -> {
-                budgetCap = 10.0
-                activeCeiling = 84
-                graceMs = 60_000L
-                stability = 35
+                // Mild malaise floor = 12.0 PTS; never drop ceiling below 88 BPM or grace below 120s
+                budgetCap = 12.0
+                activeCeiling = 88
+                graceMs = 120_000L
+                stability = 45
             }
         }
 
@@ -555,10 +627,18 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
             dailyBurn = 0.0
             dailyPeakHr = currentHr
             excursionDurationSec = 0L
+            excursionBurn = 0.0
             inExcursion = false
+            // Reset to safe baseline at 04:00 AM rollover before checking Health Connect
+            budgetCap = BASE_DAILY_BUDGET
+            activeCeiling = DEFAULT_CEILING_BPM
+            graceMs = DEFAULT_GRACE_BUFFER_MS
             prefs.edit()
                 .putString(KEY_POINTS_DATE, today)
                 .putFloat(KEY_DAILY_BURN, 0f)
+                .putFloat(KEY_BUDGET_CAP, BASE_DAILY_BUDGET.toFloat())
+                .putInt(KEY_ACTIVE_CEILING, DEFAULT_CEILING_BPM)
+                .putLong(KEY_GRACE_MS, DEFAULT_GRACE_BUFFER_MS)
                 .putInt(KEY_DAILY_PEAK_HR, currentHr)
                 .putLong(KEY_LAST_EXCURSION_SEC, 0L)
                 .apply()
@@ -568,6 +648,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
             budgetCap = prefs.getFloat(KEY_BUDGET_CAP, BASE_DAILY_BUDGET.toFloat()).toDouble()
             activeCeiling = prefs.getInt(KEY_ACTIVE_CEILING, DEFAULT_CEILING_BPM)
             graceMs = prefs.getLong(KEY_GRACE_MS, DEFAULT_GRACE_BUFFER_MS)
+            postureMultiplier = prefs.getFloat(KEY_POSTURE_MULT, POSTURE_RECLINED.toFloat()).toDouble()
             morningHrv = prefs.getFloat(KEY_MORNING_HRV, BASELINE_HRV_RMSSD.toFloat()).toDouble()
             stability = prefs.getInt(KEY_STABILITY, 75)
             val savedPeak = prefs.getInt(KEY_DAILY_PEAK_HR, 0)
@@ -592,6 +673,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
             putExtra(EXTRA_EXCURSION_POINTS, excursionBurn)
             putExtra(EXTRA_STABILITY_SCORE, stability)
             putExtra(EXTRA_ACTIVE_CEILING, activeCeiling)
+            putExtra(EXTRA_POSTURE_MULT, postureMultiplier)
             putExtra(EXTRA_MODE, "COCKPIT_LIVE")
             putExtra(EXTRA_BLE_STATUS, bleStatus)
             setPackage(packageName)
@@ -625,7 +707,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
     }
 
     private fun updateNotification() {
-        val rem = budgetCap - dailyBurn
+        val rem = (budgetCap - dailyBurn).coerceAtLeast(0.0)
         val txt = when {
             currentHr <= 0 -> "$bleStatus | REMAIN: ${String.format(Locale.US, "%.1f", rem)} PTS"
             inExcursion -> "EXCURSION: $currentHr BPM | REMAIN: ${String.format(Locale.US, "%.1f", rem)} PTS"
@@ -646,6 +728,10 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         const val DEFAULT_GRACE_BUFFER_MS = 120_000L
         const val BASELINE_HRV_RMSSD = 50.0
 
+        const val POSTURE_RECLINED = 0.20
+        const val POSTURE_SEATED = 0.70
+        const val POSTURE_UPRIGHT = 1.00
+
         const val BLE_PACKET_TIMEOUT_MS = 15_000L
         const val FROZEN_HR_TIMEOUT_MS = 300_000L // 5 minutes
         const val MAX_PACKET_DELTA_SEC = 5.0
@@ -655,6 +741,8 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         const val ALERT_MODE_SILENCE = "SILENCE"
         const val KEY_ALERT_MODE = "alert_mode"
         const val ACTION_STOP_TTS = "com.haven.pacing.ACTION_STOP_TTS"
+        const val ACTION_SET_POSTURE = "com.haven.pacing.ACTION_SET_POSTURE"
+        const val ACTION_TEST_ALERT = "com.haven.pacing.ACTION_TEST_ALERT"
 
         const val KEY_DAILY_BURN = "daily_burned"
         const val KEY_BUDGET_CAP = "budget_cap"
@@ -663,6 +751,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         const val KEY_ACTIVE_CEILING = "active_ceiling"
         const val KEY_GRACE_MS = "grace_ms"
         const val KEY_STABILITY = "stability"
+        const val KEY_POSTURE_MULT = "posture_mult"
         const val KEY_SAVED_DEVICE_ADDR = "saved_device_addr"
         const val KEY_DAILY_PEAK_HR = "daily_peak_hr"
         const val KEY_LAST_EXCURSION_SEC = "last_excursion_sec"
@@ -678,6 +767,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener {
         const val EXTRA_EXCURSION_POINTS = "extra_excursion_points"
         const val EXTRA_STABILITY_SCORE = "extra_stability_score"
         const val EXTRA_ACTIVE_CEILING = "extra_active_ceiling"
+        const val EXTRA_POSTURE_MULT = "extra_posture_mult"
         const val EXTRA_MODE = "extra_mode"
         const val EXTRA_BLE_STATUS = "extra_ble_status"
 
