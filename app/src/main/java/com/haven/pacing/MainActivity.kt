@@ -69,6 +69,7 @@ class MainActivity : AppCompatActivity() {
     private var lastRecordedExcursionSec: Int = 0
     private var latchedPeakHr: Int = 0
     private var currentSurgePeakHr: Int = 0
+    private var activePostureMult: Double = HavenPacingService.POSTURE_RECLINED
 
     private val healthPermissions = setOf(
         HealthPermission.getReadPermission(HeartRateVariabilityRmssdRecord::class),
@@ -137,6 +138,7 @@ class MainActivity : AppCompatActivity() {
                     intent.getIntExtra(HavenPacingService.EXTRA_STABILITY_SCORE, 75),
                     intent.getIntExtra(HavenPacingService.EXTRA_ACTIVE_CEILING, 88),
                     intent.getIntExtra(HavenPacingService.EXTRA_GRACE_SEC, 120),
+                    intent.getDoubleExtra(HavenPacingService.EXTRA_POSTURE_MULT, activePostureMult),
                     intent.getStringExtra(HavenPacingService.EXTRA_MODE) ?: "COCKPIT_LIVE",
                     intent.getStringExtra(HavenPacingService.EXTRA_BLE_STATUS) ?: ""
                 )
@@ -173,7 +175,14 @@ class MainActivity : AppCompatActivity() {
 
         vaultManager = VaultManager(HavenDatabase.getDatabase(this))
 
+        val prefs = getSharedPreferences(HavenPacingService.PREFS_NAME, Context.MODE_PRIVATE)
+        activePostureMult = prefs.getFloat(
+            HavenPacingService.KEY_POSTURE_MULT,
+            HavenPacingService.POSTURE_RECLINED.toFloat()
+        ).toDouble()
+
         setupAlertModeToggle()
+        setupPostureToggle()
 
         btnArm.setOnClickListener {
             Toast.makeText(this, "Checking BLE & Permissions...", Toast.LENGTH_SHORT).show()
@@ -234,8 +243,39 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        renderTelemetry(0, 0, false, 0, 0.0, 20.0, 0.0, 75, 88, 120, "COCKPIT_LIVE", "BLE: READY - TAP 'ARM' TO START")
+        renderTelemetry(
+            0, 0, false, 0, 0.0, 20.0, 0.0, 75, 88, 120,
+            activePostureMult, "COCKPIT_LIVE", "BLE: READY - TAP 'ARM' TO START"
+        )
         checkPermissionsAndStartService()
+    }
+
+    private fun setupPostureToggle() {
+        tvMode.setOnClickListener {
+            activePostureMult = when {
+                activePostureMult <= 0.25 -> HavenPacingService.POSTURE_SEATED
+                activePostureMult <= 0.75 -> HavenPacingService.POSTURE_UPRIGHT
+                else -> HavenPacingService.POSTURE_RECLINED
+            }
+            getSharedPreferences(HavenPacingService.PREFS_NAME, Context.MODE_PRIVATE)
+                .edit()
+                .putFloat(HavenPacingService.KEY_POSTURE_MULT, activePostureMult.toFloat())
+                .apply()
+
+            try {
+                startService(Intent(this, HavenPacingService::class.java).apply {
+                    action = HavenPacingService.ACTION_SET_POSTURE
+                    putExtra(HavenPacingService.EXTRA_POSTURE_MULT, activePostureMult)
+                })
+            } catch (_: Exception) { }
+
+            val label = when {
+                activePostureMult <= 0.25 -> "POSTURE: RECLINED (0.20x)"
+                activePostureMult <= 0.75 -> "POSTURE: SEATED (0.70x)"
+                else -> "POSTURE: UPRIGHT (1.00x)"
+            }
+            Toast.makeText(this, label, Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun setupAlertModeToggle() {
@@ -271,6 +311,16 @@ class MainActivity : AppCompatActivity() {
                     vibrator?.vibrate(60L)
                 }
             }
+        }
+
+        btnAlertMode.setOnLongClickListener {
+            Toast.makeText(this, "Testing Alarm-Stream Voice Alert...", Toast.LENGTH_SHORT).show()
+            try {
+                startService(Intent(this, HavenPacingService::class.java).apply {
+                    action = HavenPacingService.ACTION_TEST_ALERT
+                })
+            } catch (_: Exception) { }
+            true
         }
     }
 
@@ -515,6 +565,11 @@ class MainActivity : AppCompatActivity() {
             ?: HavenPacingService.ALERT_MODE_VOX
         renderAlertModeButton(savedAlertMode)
 
+        activePostureMult = prefs.getFloat(
+            HavenPacingService.KEY_POSTURE_MULT,
+            HavenPacingService.POSTURE_RECLINED.toFloat()
+        ).toDouble()
+
         val filter = IntentFilter(HavenPacingService.ACTION_HUD_UPDATE)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(hudReceiver, filter, Context.RECEIVER_NOT_EXPORTED)
@@ -552,9 +607,12 @@ class MainActivity : AppCompatActivity() {
         stability: Int,
         ceiling: Int,
         graceSec: Int,
+        postureMult: Double,
         mode: String,
         bleStatus: String = ""
     ) {
+        activePostureMult = postureMult
+
         if (hr > 0) {
             tvLiveHr.text = hr.toString()
             vuHr.setLevel((hr - 40).coerceAtLeast(0).toFloat(), 70f)
@@ -677,11 +735,16 @@ class MainActivity : AppCompatActivity() {
             }
         )
 
+        val postureTag = when {
+            postureMult <= 0.25 -> "RECLINED 0.20x"
+            postureMult <= 0.75 -> "SEATED 0.70x"
+            else -> "UPRIGHT 1.00x"
+        }
         if (mode == "COCKPIT_DARK") {
-            tvMode.text = "[ COCKPIT DARK ]"
+            tvMode.text = "[ COCKPIT DARK | $postureTag ]"
             tvMode.setTextColor(Color.parseColor("#757575"))
         } else {
-            tvMode.text = "[ COCKPIT LIVE ]"
+            tvMode.text = "[ COCKPIT LIVE | $postureTag ]"
             tvMode.setTextColor(Color.parseColor("#00E676"))
         }
     }
