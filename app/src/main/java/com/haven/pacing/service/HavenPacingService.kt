@@ -83,6 +83,8 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
         const val KEY_DAILY_POINTS = "daily_points"
         const val KEY_ACTIVE_DAY = "active_day_key"
         const val KEY_MANUAL_POSTURE_OVERRIDE = "manual_posture_override"
+        const val KEY_CALIBRATION_EPOCH = "calibration_epoch"
+        const val CURRENT_CALIBRATION_EPOCH = 2
 
         const val POSTURE_RECLINED = 0.20
         const val POSTURE_SEATED = 0.70
@@ -96,6 +98,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
         const val ACTION_SET_POSTURE = "com.haven.pacing.ACTION_SET_POSTURE"
         const val ACTION_STOP_TTS = "com.haven.pacing.ACTION_STOP_TTS"
         const val ACTION_TEST_ALERT = "com.haven.pacing.ACTION_TEST_ALERT"
+        const val ACTION_RESET_DAILY_POINTS = "com.haven.pacing.ACTION_RESET_DAILY_POINTS"
 
         // HUD Broadcast & Extras expected by MainActivity
         const val ACTION_HUD_UPDATE = "com.haven.pacing.ACTION_HUD_UPDATE"
@@ -249,6 +252,17 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
                 val sampleHr = if (currentFilteredHr > 0) currentFilteredHr else 79
                 dispatchAlert(sampleHr, forceVoice = true)
             }
+            ACTION_RESET_DAILY_POINTS -> {
+                dailyPoints = 0.0
+                excursionPoints = 0.0
+                excursionPeakHr = 0
+                inExcursion = false
+                excursionElapsedSec = 0
+                awaitingRecoveryClear = false
+                belowThresholdSinceMs = 0L
+                persistDailyPoints()
+                refreshNotificationAndHud()
+            }
             else -> {
                 registerSensors()
                 serviceScope.launch {
@@ -377,7 +391,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
 
         val now = System.currentTimeMillis()
         val dtSec = if (lastHrTickMs > 0L) {
-            ((now - lastHrTickMs) / 1000.0).coerceIn(0.5, 5.0)
+            ((now - lastHrTickMs) / 1000.0).coerceIn(0.5, 2.0)
         } else {
             1.0
         }
@@ -411,7 +425,6 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
             val graceExpired = excursionElapsedSec >= DEFAULT_GRACE_SEC
             val emergencySpike = filteredBpm >= ANAEROBIC_EMERGENCY_BPM
 
-            // Grace Buffer protection: 0.0 PTS during initial 120s unless anaerobic (>=115 BPM)
             if (graceExpired || emergencySpike) {
                 val bpmAboveCeiling = (filteredBpm - (activeCeilingBpm - 1)).coerceAtLeast(1)
                 val basePtsPerMin = (bpmAboveCeiling / 20.0) * 0.50
@@ -885,7 +898,9 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
     private fun loadPersistedState() {
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
         val savedDay = prefs.getString(KEY_ACTIVE_DAY, null)
-        if (savedDay == activeDayKey) {
+        val savedEpoch = prefs.getInt(KEY_CALIBRATION_EPOCH, 0)
+
+        if (savedDay == activeDayKey && savedEpoch == CURRENT_CALIBRATION_EPOCH) {
             dailyPoints = prefs.getFloat(KEY_DAILY_POINTS, 0f).toDouble()
         } else {
             dailyPoints = 0.0
@@ -898,6 +913,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
     private fun persistDailyPoints() {
         getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
             .putString(KEY_ACTIVE_DAY, activeDayKey)
+            .putInt(KEY_CALIBRATION_EPOCH, CURRENT_CALIBRATION_EPOCH)
             .putFloat(KEY_DAILY_POINTS, dailyPoints.toFloat())
             .apply()
     }
