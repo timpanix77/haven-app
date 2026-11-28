@@ -1,4 +1,4 @@
-package com.haven.cockpit
+package com.haven.pacing
 
 import android.annotation.SuppressLint
 import android.app.Notification
@@ -96,10 +96,10 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
         const val MULT_UPRIGHT = 1.00
 
         // Broadcast Actions
-        const val ACTION_START_ARM = "com.haven.cockpit.ACTION_START_ARM"
-        const val ACTION_STOP_DISARM = "com.haven.cockpit.ACTION_STOP_DISARM"
-        const val ACTION_TEST_VOICE = "com.haven.cockpit.ACTION_TEST_VOICE"
-        const val ACTION_CYCLE_POSTURE_OVERRIDE = "com.haven.cockpit.ACTION_CYCLE_POSTURE_OVERRIDE"
+        const val ACTION_START_ARM = "com.haven.pacing.ACTION_START_ARM"
+        const val ACTION_STOP_DISARM = "com.haven.pacing.ACTION_STOP_DISARM"
+        const val ACTION_TEST_VOICE = "com.haven.pacing.ACTION_TEST_VOICE"
+        const val ACTION_CYCLE_POSTURE_OVERRIDE = "com.haven.pacing.ACTION_CYCLE_POSTURE_OVERRIDE"
     }
 
     enum class PostureState(val label: String, val multiplier: Double) {
@@ -281,7 +281,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
             null -> PostureState.RECLINED
             PostureState.RECLINED -> PostureState.SEATED
             PostureState.SEATED -> PostureState.UPRIGHT
-            PostureState.UPRIGHT -> null // Return to autonomous sensor inference
+            PostureState.UPRIGHT -> null
         }
         val activePosture = manualPostureOverride ?: inferAutonomousPosture(_uiState.value.currentBpm)
         _uiState.value = _uiState.value.copy(
@@ -340,21 +340,16 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
             powerManager.isInteractive ||
             (now - lastScreenInteractiveMs) < 15 * 60_000L
 
-        // Scenario A: Phone left stationary (nightstand / sofa / kitchen table)
         if (isStationary) {
-            // Unattended-phone HR excursion override (bathroom trip, feeding Sue, letting Red out)
             if (currentBpm >= CEILING_BPM) {
                 return PostureState.UPRIGHT
             }
-            // Kitchen table with YouTube/media playing or recently unlocked screen
             if (mediaOrScreenActive) {
                 return if (currentBpm >= 96) PostureState.UPRIGHT else PostureState.SEATED
             }
-            // Stationary, dark screen, settled HR -> resting reclined
             return PostureState.RECLINED
         }
 
-        // Scenario B: Phone on-body / in-hand / moving
         val mag = sqrt(gravX * gravX + gravY * gravY + gravZ * gravZ).coerceAtLeast(0.1f)
         val normY = abs(gravY) / mag
         val normZ = abs(gravZ) / mag
@@ -402,7 +397,6 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
         var elapsedSec = 0L
 
         if (filteredBpm >= CEILING_BPM) {
-            // Reset below-threshold recovery timer if HR climbs back above ceiling
             belowThresholdSinceMs = 0L
 
             if (!inExc) {
@@ -419,13 +413,11 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
             excursionBpmSum += filteredBpm
             excursionSamples++
 
-            // Accumulate PacePoints weighted by inferred posture multiplier
             val bpmAboveFloor = (filteredBpm - 65).coerceAtLeast(1)
             val rawPtsPerMin = (bpmAboveFloor / 25.0) * 1.25
             val stepPts = rawPtsPerMin * (dtSec / 60.0) * inferredPosture.multiplier
             spent += stepPts
 
-            // High-HR voice telemetry: after 120s grace or immediate >= 115 BPM emergency
             val graceExpired = elapsedSec >= GRACE_SECONDS
             val emergencySpike = filteredBpm >= ANAEROBIC_EMERGENCY_BPM
             if ((graceExpired || emergencySpike) && (now - lastVoiceAlertMs >= VOICE_REPEAT_COOLDOWN_MS)) {
@@ -440,7 +432,6 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
             }
             elapsedSec = 0L
 
-            // Below-threshold recovery announcement (only after a high-HR alert was spoken)
             if (awaitingRecoveryClear) {
                 if (belowThresholdSinceMs == 0L) {
                     belowThresholdSinceMs = now
@@ -553,7 +544,6 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
             val hcClient = HealthConnectClient.getOrCreate(this)
             val now = Instant.now()
 
-            // Primary window: trailing 16h; Fallback window: trailing 72h for fragmented ME/CFS sleep
             val hrvResponse72h = hcClient.readRecords(
                 ReadRecordsRequest(
                     recordType = HeartRateVariabilityRmssdRecord::class,
@@ -596,7 +586,6 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
                 rmssd >= 26.0 -> 15.0
                 else -> 12.0
             }
-            // Slight conservative trim if using a >16h lookback record due to broken sleep
             val adjusted = if (isFreshOvernight) rawCap else (rawCap - 1.5)
             computedCap = adjusted.coerceIn(BUDGET_FLOOR_PTS, BUDGET_MAX_PTS)
             sourceNote = if (isFreshOvernight) {
@@ -632,7 +621,6 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
         val adapter = bluetoothAdapter ?: return
         if (!adapter.isEnabled || isScanning) return
 
-        // Check if already connected to a paired HR peripheral
         val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         val connectedDevices = btManager.getConnectedDevices(BluetoothProfile.GATT)
         val existingVenu = connectedDevices.firstOrNull {
