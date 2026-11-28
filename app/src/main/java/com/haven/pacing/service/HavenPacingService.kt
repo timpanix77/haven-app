@@ -1,4 +1,4 @@
-package com.haven.pacing
+package com.haven.pacing.service
 
 import android.annotation.SuppressLint
 import android.app.Notification
@@ -30,7 +30,6 @@ import android.hardware.SensorManager
 import android.media.AudioAttributes
 import android.media.AudioDeviceInfo
 import android.media.AudioManager
-import android.os.Binder
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -38,6 +37,8 @@ import android.os.IBinder
 import android.os.Looper
 import android.os.ParcelUuid
 import android.os.PowerManager
+import android.os.VibrationEffect
+import android.os.Vibrator
 import android.speech.tts.TextToSpeech
 import android.util.Log
 import androidx.core.app.NotificationCompat
@@ -46,15 +47,15 @@ import androidx.health.connect.client.records.HeartRateVariabilityRmssdRecord
 import androidx.health.connect.client.records.RestingHeartRateRecord
 import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.time.TimeRangeFilter
+import com.haven.pacing.MainActivity
+import com.haven.pacing.data.ExcursionRecord
+import com.haven.pacing.data.HavenDatabase
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.MutableStateFlow
-import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.time.Instant
 import java.time.ZoneId
@@ -64,6 +65,7 @@ import java.util.Locale
 import java.util.UUID
 import kotlin.math.abs
 import kotlin.math.max
+import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventListener {
@@ -73,92 +75,104 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
         private const val CHANNEL_ID = "haven_pacing_channel"
         private const val NOTIFICATION_ID = 1001
 
+        // SharedPreferences & Constants expected by MainActivity
+        const val PREFS_NAME = "haven_pacing_prefs"
+        const val KEY_POSTURE_MULT = "posture_mult"
+        const val KEY_ALERT_MODE = "alert_mode"
+        const val KEY_DAILY_POINTS = "daily_points"
+        const val KEY_ACTIVE_DAY = "active_day_key"
+        const val KEY_MANUAL_POSTURE_OVERRIDE = "manual_posture_override"
+
+        const val POSTURE_RECLINED = 0.20
+        const val POSTURE_SEATED = 0.70
+        const val POSTURE_UPRIGHT = 1.00
+
+        const val ALERT_MODE_VOX = "VOX"
+        const val ALERT_MODE_VIBRATE = "VIBRATE"
+        const val ALERT_MODE_SILENCE = "SILENCE"
+
+        // Service Actions expected by MainActivity
+        const val ACTION_SET_POSTURE = "com.haven.pacing.ACTION_SET_POSTURE"
+        const val ACTION_STOP_TTS = "com.haven.pacing.ACTION_STOP_TTS"
+        const val ACTION_TEST_ALERT = "com.haven.pacing.ACTION_TEST_ALERT"
+
+        // HUD Broadcast & Extras expected by MainActivity
+        const val ACTION_HUD_UPDATE = "com.haven.pacing.ACTION_HUD_UPDATE"
+        const val EXTRA_HR = "extra_hr"
+        const val EXTRA_EXCURSION_SEC = "extra_excursion_sec"
+        const val EXTRA_IN_EXCURSION = "extra_in_excursion"
+        const val EXTRA_PEAK_HR = "extra_peak_hr"
+        const val EXTRA_DAILY_POINTS = "extra_daily_points"
+        const val EXTRA_BUDGET_POINTS = "extra_budget_points"
+        const val EXTRA_EXCURSION_POINTS = "extra_excursion_points"
+        const val EXTRA_STABILITY_SCORE = "extra_stability_score"
+        const val EXTRA_ACTIVE_CEILING = "extra_active_ceiling"
+        const val EXTRA_GRACE_SEC = "extra_grace_sec"
+        const val EXTRA_POSTURE_MULT = "extra_posture_mult"
+        const val EXTRA_MODE = "extra_mode"
+        const val EXTRA_BLE_STATUS = "extra_ble_status"
+
         // Standard Bluetooth Heart Rate Service & Characteristics
         val HR_SERVICE_UUID: UUID = UUID.fromString("0000180d-0000-1000-8000-00805f9b34fb")
         val HR_MEASUREMENT_CHAR_UUID: UUID = UUID.fromString("00002a37-0000-1000-8000-00805f9b34fb")
         val CCCD_UUID: UUID = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
 
-        // Biometric & Pacing Constants
-        const val CEILING_BPM = 89
+        // Pacing & Biometric Thresholds
+        const val DEFAULT_CEILING_BPM = 89
         const val RECOVERY_CLEAR_BPM = 82
         const val RECOVERY_SETTLE_SECONDS = 30L
         const val ANAEROBIC_EMERGENCY_BPM = 115
-        const val GRACE_SECONDS = 120L
+        const val DEFAULT_GRACE_SEC = 120
         const val VOICE_REPEAT_COOLDOWN_MS = 90_000L
 
         const val BUDGET_FLOOR_PTS = 12.0
         const val BUDGET_DEFAULT_PTS = 16.0
         const val BUDGET_MAX_PTS = 20.0
 
-        // Posture Multipliers
-        const val MULT_RECLINED = 0.20
-        const val MULT_SEATED = 0.70
-        const val MULT_UPRIGHT = 1.00
-
-        // Broadcast Actions
-        const val ACTION_START_ARM = "com.haven.pacing.ACTION_START_ARM"
-        const val ACTION_STOP_DISARM = "com.haven.pacing.ACTION_STOP_DISARM"
-        const val ACTION_TEST_VOICE = "com.haven.pacing.ACTION_TEST_VOICE"
-        const val ACTION_CYCLE_POSTURE_OVERRIDE = "com.haven.pacing.ACTION_CYCLE_POSTURE_OVERRIDE"
+        @Volatile
+        var isServiceRunning: Boolean = false
     }
 
-    enum class PostureState(val label: String, val multiplier: Double) {
-        RECLINED("RECLINED", MULT_RECLINED),
-        SEATED("SEATED", MULT_SEATED),
-        UPRIGHT("UPRIGHT", MULT_UPRIGHT)
-    }
-
-    data class TelemetryUiState(
-        val isArmed: Boolean = false,
-        val connectionStatus: String = "DISARMED",
-        val deviceName: String = "--",
-        val currentBpm: Int = 0,
-        val posture: PostureState = PostureState.RECLINED,
-        val isPostureManualOverride: Boolean = false,
-        val dailyCapPts: Double = BUDGET_DEFAULT_PTS,
-        val spentPts: Double = 0.0,
-        val morningHrvRmssd: Double? = null,
-        val hrvSourceNote: String = "Baseline Guard",
-        val inExcursion: Boolean = false,
-        val excursionElapsedSec: Long = 0L,
-        val isHeadsetConnected: Boolean = false,
-        val awaitingRecoveryClear: Boolean = false
-    )
-
-    inner class LocalBinder : Binder() {
-        fun getService(): HavenPacingService = this@HavenPacingService
-    }
-
-    private val binder = LocalBinder()
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private val mainHandler = Handler(Looper.getMainLooper())
-
-    private val _uiState = MutableStateFlow(TelemetryUiState())
-    val uiState: StateFlow<TelemetryUiState> = _uiState.asStateFlow()
 
     // Bluetooth LE
     private var bluetoothAdapter: BluetoothAdapter? = null
     private var bluetoothGatt: BluetoothGatt? = null
     private var isScanning = false
     private var reconnectJob: Job? = null
+    private var bleStatusText: String = "BLE: SCANNING FOR VENU..."
 
-    // HR Median Filter & Excursion / Recovery Tracking
+    // Telemetry & Excursion State
     private val hrWindow = ArrayDeque<Int>(3)
+    private var currentFilteredHr: Int = 0
     private var lastHrTickMs: Long = 0L
+
+    private var inExcursion: Boolean = false
     private var excursionStartMs: Long = 0L
-    private var excursionPeakBpm: Int = 0
-    private var excursionBpmSum: Long = 0L
-    private var excursionSamples: Int = 0
+    private var excursionElapsedSec: Int = 0
+    private var excursionPeakHr: Int = 0
+    private var excursionPoints: Double = 0.0
     private var lastVoiceAlertMs: Long = 0L
+
+    // Below-threshold recovery state
     private var awaitingRecoveryClear: Boolean = false
     private var belowThresholdSinceMs: Long = 0L
+
+    // Budget & Governor State
     private var activeDayKey: String = ""
+    private var dailyPoints: Double = 0.0
+    private var budgetPoints: Double = BUDGET_DEFAULT_PTS
+    private var activeCeilingBpm: Int = DEFAULT_CEILING_BPM
+    private var stabilityScore: Int = 75
+    private var activePostureMult: Double = POSTURE_RECLINED
+    private var hasManualPostureOverride: Boolean = false
 
     // TTS Audio
     private var tts: TextToSpeech? = null
     private var ttsReady = false
 
-    // Sensors & Posture Inference
+    // Sensors & Autonomous Posture Inference
     private lateinit var sensorManager: SensorManager
     private var gravitySensor: Sensor? = null
     private var stepDetectorSensor: Sensor? = null
@@ -170,7 +184,6 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
     private var motionVarianceEma = 0f
     private var lastStepTimestampMs = 0L
     private var lastScreenInteractiveMs = 0L
-    private var manualPostureOverride: PostureState? = null
 
     private val screenReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context?, intent: Intent?) {
@@ -182,6 +195,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
 
     override fun onCreate() {
         super.onCreate()
+        isServiceRunning = true
         createNotificationChannel()
 
         val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
@@ -204,34 +218,46 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
         loadPersistedState()
     }
 
-    override fun onBind(intent: Intent?): IBinder = binder
+    override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        ensureForeground()
+
         when (intent?.action) {
-            ACTION_STOP_DISARM -> {
-                disarmService()
-                return START_NOT_STICKY
+            ACTION_SET_POSTURE -> {
+                val requested = intent.getDoubleExtra(EXTRA_POSTURE_MULT, POSTURE_RECLINED)
+                activePostureMult = requested
+                hasManualPostureOverride = true
+                getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+                    .putFloat(KEY_POSTURE_MULT, activePostureMult.toFloat())
+                    .putBoolean(KEY_MANUAL_POSTURE_OVERRIDE, true)
+                    .apply()
+                broadcastHudUpdate()
             }
-            ACTION_TEST_VOICE -> {
-                val testBpm = _uiState.value.currentBpm.takeIf { it > 0 } ?: 79
-                speakTelemetry(testBpm)
-                return START_STICKY
+            ACTION_STOP_TTS -> {
+                try {
+                    tts?.stop()
+                } catch (_: Exception) { }
             }
-            ACTION_CYCLE_POSTURE_OVERRIDE -> {
-                cycleManualPostureOverride()
-                return START_STICKY
+            ACTION_TEST_ALERT -> {
+                val sampleHr = if (currentFilteredHr > 0) currentFilteredHr else 79
+                dispatchAlert(sampleHr, forceVoice = true)
             }
             else -> {
-                armService()
+                registerSensors()
+                serviceScope.launch {
+                    refreshDailyGovernorFromHealthConnect()
+                }
+                startBleScan()
+                broadcastHudUpdate()
             }
         }
+
         return START_STICKY
     }
 
-    fun armService() {
-        if (_uiState.value.isArmed) return
-
-        val notification = buildForegroundNotification("Scanning for Garmin Venu...")
+    private fun ensureForeground() {
+        val notification = buildForegroundNotification("HAVEN Cockpit Live • Armed")
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
                 NOTIFICATION_ID,
@@ -241,53 +267,6 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
-
-        registerSensors()
-        _uiState.value = _uiState.value.copy(
-            isArmed = true,
-            connectionStatus = "SCANNING",
-            isHeadsetConnected = hasExternalHeadset()
-        )
-
-        serviceScope.launch {
-            refreshDailyGovernorFromHealthConnect()
-        }
-
-        startBleScan()
-    }
-
-    fun disarmService() {
-        closeActiveExcursionIfNeeded()
-        awaitingRecoveryClear = false
-        belowThresholdSinceMs = 0L
-        stopBleScan()
-        disconnectGatt()
-        unregisterSensors()
-
-        _uiState.value = _uiState.value.copy(
-            isArmed = false,
-            connectionStatus = "DISARMED",
-            currentBpm = 0,
-            inExcursion = false,
-            excursionElapsedSec = 0L,
-            awaitingRecoveryClear = false
-        )
-        stopForeground(STOP_FOREGROUND_REMOVE)
-        stopSelf()
-    }
-
-    fun cycleManualPostureOverride() {
-        manualPostureOverride = when (manualPostureOverride) {
-            null -> PostureState.RECLINED
-            PostureState.RECLINED -> PostureState.SEATED
-            PostureState.SEATED -> PostureState.UPRIGHT
-            PostureState.UPRIGHT -> null
-        }
-        val activePosture = manualPostureOverride ?: inferAutonomousPosture(_uiState.value.currentBpm)
-        _uiState.value = _uiState.value.copy(
-            posture = activePosture,
-            isPostureManualOverride = manualPostureOverride != null
-        )
     }
 
     // -------------------------------------------------------------------------
@@ -304,7 +283,9 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
     }
 
     private fun unregisterSensors() {
-        sensorManager.unregisterListener(this)
+        try {
+            sensorManager.unregisterListener(this)
+        } catch (_: Exception) { }
     }
 
     override fun onSensorChanged(event: SensorEvent?) {
@@ -321,14 +302,23 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
             }
             Sensor.TYPE_STEP_DETECTOR -> {
                 lastStepTimestampMs = System.currentTimeMillis()
+                // Walking clears any stale manual posture lock so autonomous tracking resumes
+                if (hasManualPostureOverride) {
+                    hasManualPostureOverride = false
+                    getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+                        .putBoolean(KEY_MANUAL_POSTURE_OVERRIDE, false)
+                        .apply()
+                }
             }
         }
     }
 
     override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 
-    private fun inferAutonomousPosture(currentBpm: Int): PostureState {
-        manualPostureOverride?.let { return it }
+    private fun inferAutonomousPostureMultiplier(hr: Int): Double {
+        if (hasManualPostureOverride) {
+            return activePostureMult
+        }
 
         val now = System.currentTimeMillis()
         val audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
@@ -340,26 +330,31 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
             powerManager.isInteractive ||
             (now - lastScreenInteractiveMs) < 15 * 60_000L
 
+        // Scenario A: Phone left stationary (nightstand / sofa / kitchen table)
         if (isStationary) {
-            if (currentBpm >= CEILING_BPM) {
-                return PostureState.UPRIGHT
+            // Unattended-phone HR excursion override (bathroom trip, feeding Sue, letting Red out)
+            if (hr >= activeCeilingBpm) {
+                return POSTURE_UPRIGHT
             }
+            // Kitchen table with YouTube/media playing or recently unlocked screen
             if (mediaOrScreenActive) {
-                return if (currentBpm >= 96) PostureState.UPRIGHT else PostureState.SEATED
+                return if (hr >= 96) POSTURE_UPRIGHT else POSTURE_SEATED
             }
-            return PostureState.RECLINED
+            // Stationary, dark screen, settled HR -> resting reclined
+            return POSTURE_RECLINED
         }
 
+        // Scenario B: Phone on-body / in-hand / moving
         val mag = sqrt(gravX * gravX + gravY * gravY + gravZ * gravZ).coerceAtLeast(0.1f)
         val normY = abs(gravY) / mag
         val normZ = abs(gravZ) / mag
 
         return when {
-            recentSteps -> PostureState.UPRIGHT
-            normZ > 0.85f && currentBpm < CEILING_BPM -> PostureState.RECLINED
-            normY > 0.78f -> PostureState.SEATED
-            currentBpm >= CEILING_BPM -> PostureState.UPRIGHT
-            else -> PostureState.SEATED
+            recentSteps -> POSTURE_UPRIGHT
+            normZ > 0.85f && hr < activeCeilingBpm -> POSTURE_RECLINED
+            normY > 0.78f -> POSTURE_SEATED
+            hr >= activeCeilingBpm -> POSTURE_UPRIGHT
+            else -> POSTURE_SEATED
         }
     }
 
@@ -378,6 +373,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
             2 -> hrWindow.average().toInt()
             else -> rawBpm
         }
+        currentFilteredHr = filteredBpm
 
         val now = System.currentTimeMillis()
         val dtSec = if (lastHrTickMs > 0L) {
@@ -389,48 +385,50 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
 
         checkDayRollover()
 
-        val inferredPosture = inferAutonomousPosture(filteredBpm)
-        val headsetConnected = hasExternalHeadset()
+        val inferredMult = inferAutonomousPostureMultiplier(filteredBpm)
+        if (abs(inferredMult - activePostureMult) > 0.01) {
+            activePostureMult = inferredMult
+            getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+                .putFloat(KEY_POSTURE_MULT, activePostureMult.toFloat())
+                .apply()
+        }
 
-        var spent = _uiState.value.spentPts
-        var inExc = _uiState.value.inExcursion
-        var elapsedSec = 0L
-
-        if (filteredBpm >= CEILING_BPM) {
+        if (filteredBpm >= activeCeilingBpm) {
             belowThresholdSinceMs = 0L
 
-            if (!inExc) {
-                inExc = true
+            if (!inExcursion) {
+                inExcursion = true
                 excursionStartMs = now
-                excursionPeakBpm = filteredBpm
-                excursionBpmSum = 0L
-                excursionSamples = 0
+                excursionElapsedSec = 0
+                excursionPeakHr = filteredBpm
+                excursionPoints = 0.0
                 lastVoiceAlertMs = 0L
             }
 
-            elapsedSec = (now - excursionStartMs) / 1000L
-            excursionPeakBpm = max(excursionPeakBpm, filteredBpm)
-            excursionBpmSum += filteredBpm
-            excursionSamples++
+            excursionElapsedSec = ((now - excursionStartMs) / 1000L).toInt()
+            excursionPeakHr = max(excursionPeakHr, filteredBpm)
 
             val bpmAboveFloor = (filteredBpm - 65).coerceAtLeast(1)
             val rawPtsPerMin = (bpmAboveFloor / 25.0) * 1.25
-            val stepPts = rawPtsPerMin * (dtSec / 60.0) * inferredPosture.multiplier
-            spent += stepPts
+            val stepPts = rawPtsPerMin * (dtSec / 60.0) * activePostureMult
 
-            val graceExpired = elapsedSec >= GRACE_SECONDS
+            excursionPoints += stepPts
+            dailyPoints += stepPts
+            persistDailyPoints()
+
+            val graceExpired = excursionElapsedSec >= DEFAULT_GRACE_SEC
             val emergencySpike = filteredBpm >= ANAEROBIC_EMERGENCY_BPM
             if ((graceExpired || emergencySpike) && (now - lastVoiceAlertMs >= VOICE_REPEAT_COOLDOWN_MS)) {
                 lastVoiceAlertMs = now
                 awaitingRecoveryClear = true
-                speakTelemetry(filteredBpm)
+                dispatchAlert(filteredBpm)
             }
         } else {
-            if (inExc) {
-                closeActiveExcursionIfNeeded()
-                inExc = false
+            if (inExcursion) {
+                closeAndPersistExcursion(settledHr = filteredBpm)
+                inExcursion = false
+                excursionElapsedSec = 0
             }
-            elapsedSec = 0L
 
             if (awaitingRecoveryClear) {
                 if (belowThresholdSinceMs == 0L) {
@@ -443,47 +441,53 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
                 if (settledCleanly) {
                     awaitingRecoveryClear = false
                     belowThresholdSinceMs = 0L
-                    speakTelemetry(filteredBpm)
+                    dispatchAlert(filteredBpm)
                 }
             }
         }
 
-        persistSpentPoints(spent)
-
-        _uiState.value = _uiState.value.copy(
-            currentBpm = filteredBpm,
-            posture = inferredPosture,
-            isPostureManualOverride = manualPostureOverride != null,
-            spentPts = spent,
-            inExcursion = inExc,
-            excursionElapsedSec = elapsedSec,
-            isHeadsetConnected = headsetConnected,
-            awaitingRecoveryClear = awaitingRecoveryClear
-        )
-
+        val postureTag = when {
+            activePostureMult <= 0.25 -> "REC"
+            activePostureMult <= 0.75 -> "SEAT"
+            else -> "UP"
+        }
         updateNotification(
-            "HR $filteredBpm BPM • ${inferredPosture.label} • " +
-                String.format(Locale.US, "%.1f/%.1f PTS", spent, _uiState.value.dailyCapPts)
+            String.format(
+                Locale.US,
+                "HR %d BPM • %s • %.1f/%.0f PTS",
+                filteredBpm,
+                postureTag,
+                dailyPoints,
+                budgetPoints
+            )
         )
+        broadcastHudUpdate()
     }
 
-    private fun closeActiveExcursionIfNeeded() {
-        if (!_uiState.value.inExcursion || excursionSamples == 0) return
-        val durationSec = ((System.currentTimeMillis() - excursionStartMs) / 1000L).coerceAtLeast(1L)
-        val avgBpm = (excursionBpmSum / excursionSamples).toInt()
-        val postureLabel = _uiState.value.posture.label
-        Log.i(
-            TAG,
-            "Excursion closed: duration=${durationSec}s, avg=$avgBpm, peak=$excursionPeakBpm, posture=$postureLabel"
+    private fun closeAndPersistExcursion(settledHr: Int) {
+        if (!inExcursion) return
+        val durationSec = ((System.currentTimeMillis() - excursionStartMs) / 1000L).toInt().coerceAtLeast(1)
+        val record = ExcursionRecord(
+            timestamp = excursionStartMs,
+            durationSeconds = durationSec,
+            peakHr = excursionPeakHr,
+            settledHr = settledHr,
+            strainPoints = (excursionPoints * 100.0).roundToInt() / 100.0
         )
+        serviceScope.launch(Dispatchers.IO) {
+            try {
+                HavenDatabase.getDatabase(this@HavenPacingService).havenDao().insert(record)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to insert ExcursionRecord: ${e.message}")
+            }
+        }
         excursionStartMs = 0L
-        excursionPeakBpm = 0
-        excursionBpmSum = 0L
-        excursionSamples = 0
+        excursionPeakHr = 0
+        excursionPoints = 0.0
     }
 
     // -------------------------------------------------------------------------
-    // 3. BLUETOOTH-AWARE TELEMETRY VOICE ("Heartrate. [BPM].")
+    // 3. BLUETOOTH-AWARE TELEMETRY VOICE ("Heartrate. [BPM].") & ALERT MODES
     // -------------------------------------------------------------------------
 
     override fun onInit(status: Int) {
@@ -507,7 +511,24 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
         }
     }
 
-    private fun speakTelemetry(bpm: Int) {
+    private fun dispatchAlert(bpm: Int, forceVoice: Boolean = false) {
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val mode = prefs.getString(KEY_ALERT_MODE, ALERT_MODE_VOX) ?: ALERT_MODE_VOX
+
+        if (!forceVoice && mode == ALERT_MODE_SILENCE) return
+
+        if (!forceVoice && mode == ALERT_MODE_VIBRATE) {
+            @Suppress("DEPRECATION")
+            val vibrator = getSystemService(Context.VIBRATOR_SERVICE) as? Vibrator
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                vibrator?.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 220, 120, 220), -1))
+            } else {
+                @Suppress("DEPRECATION")
+                vibrator?.vibrate(400L)
+            }
+            return
+        }
+
         if (!ttsReady) return
 
         val useHeadset = hasExternalHeadset()
@@ -526,14 +547,14 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
             putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, 1.0f)
         }
 
-        tts?.speak("Heartrate. $bpm.", TextToSpeech.QUEUE_FLUSH, params, "HAVEN_HR_ALERT")
+        tts?.speak("Heartrate. $bpm.", TextToSpeech.QUEUE_FLUSH, params, "HAVEN_HR_TELEMETRY")
     }
 
     // -------------------------------------------------------------------------
     // 4. HEALTH CONNECT HRV GOVERNOR WITH 72-HOUR & RHR FALLBACK
     // -------------------------------------------------------------------------
 
-    suspend fun refreshDailyGovernorFromHealthConnect() {
+    private suspend fun refreshDailyGovernorFromHealthConnect() {
         try {
             val status = HealthConnectClient.getSdkStatus(this)
             if (status != HealthConnectClient.SDK_AVAILABLE) {
@@ -544,13 +565,14 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
             val hcClient = HealthConnectClient.getOrCreate(this)
             val now = Instant.now()
 
-            val hrvResponse72h = hcClient.readRecords(
+            // Primary window: 16h; Fallback window: 72h for fragmented ME/CFS sleep
+            val hrvResponse = hcClient.readRecords(
                 ReadRecordsRequest(
                     recordType = HeartRateVariabilityRmssdRecord::class,
                     timeRangeFilter = TimeRangeFilter.between(now.minus(72, ChronoUnit.HOURS), now)
                 )
             )
-            val latestHrv = hrvResponse72h.records.maxByOrNull { it.time }
+            val latestHrv = hrvResponse.records.maxByOrNull { it.time }
 
             val rhrResponse = hcClient.readRecords(
                 ReadRecordsRequest(
@@ -562,7 +584,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
 
             applyBudgetGovernor(latestHrv, latestRhr)
         } catch (e: Exception) {
-            Log.w(TAG, "Health Connect read fallback triggered: ${e.message}")
+            Log.w(TAG, "Health Connect fallback triggered: ${e.message}")
             applyBudgetGovernor(null, null)
         }
     }
@@ -575,9 +597,6 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
         val isFreshOvernight = hrvRecord != null &&
             ChronoUnit.HOURS.between(hrvRecord.time, now) <= 16
 
-        val computedCap: Double
-        val sourceNote: String
-
         if (hrvRecord != null) {
             val rmssd = hrvRecord.heartRateVariabilityMillis
             val rawCap = when {
@@ -587,29 +606,31 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
                 else -> 12.0
             }
             val adjusted = if (isFreshOvernight) rawCap else (rawCap - 1.5)
-            computedCap = adjusted.coerceIn(BUDGET_FLOOR_PTS, BUDGET_MAX_PTS)
-            sourceNote = if (isFreshOvernight) {
-                "Overnight RMSSD ${rmssd.toInt()}ms"
-            } else {
-                "72h Fallback RMSSD ${rmssd.toInt()}ms"
+            budgetPoints = adjusted.coerceIn(BUDGET_FLOOR_PTS, BUDGET_MAX_PTS)
+            stabilityScore = when {
+                rmssd >= 45.0 -> 88
+                rmssd >= 35.0 -> 78
+                rmssd >= 26.0 -> 64
+                else -> 48
             }
         } else if (restingBpm != null) {
-            computedCap = when {
+            budgetPoints = when {
                 restingBpm <= 66 -> 18.0
                 restingBpm <= 72 -> 15.0
                 else -> 12.0
             }
-            sourceNote = "RHR Floor Fallback (${restingBpm} BPM)"
+            stabilityScore = when {
+                restingBpm <= 66 -> 78
+                restingBpm <= 72 -> 64
+                else -> 48
+            }
         } else {
-            computedCap = BUDGET_DEFAULT_PTS
-            sourceNote = "Fragmented Sleep Safe Default"
+            budgetPoints = BUDGET_DEFAULT_PTS
+            stabilityScore = 70
         }
 
-        _uiState.value = _uiState.value.copy(
-            dailyCapPts = computedCap,
-            morningHrvRmssd = hrvRecord?.heartRateVariabilityMillis,
-            hrvSourceNote = sourceNote
-        )
+        activeCeilingBpm = DEFAULT_CEILING_BPM
+        broadcastHudUpdate()
     }
 
     // -------------------------------------------------------------------------
@@ -619,7 +640,12 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
     @SuppressLint("MissingPermission")
     private fun startBleScan() {
         val adapter = bluetoothAdapter ?: return
-        if (!adapter.isEnabled || isScanning) return
+        if (!adapter.isEnabled) {
+            bleStatusText = "BLE: BLUETOOTH OFF"
+            broadcastHudUpdate()
+            return
+        }
+        if (isScanning) return
 
         val btManager = getSystemService(Context.BLUETOOTH_SERVICE) as BluetoothManager
         val connectedDevices = btManager.getConnectedDevices(BluetoothProfile.GATT)
@@ -641,6 +667,8 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
             .build()
 
         isScanning = true
+        bleStatusText = "BLE: SCANNING FOR VENU..."
+        broadcastHudUpdate()
         scanner.startScan(listOf(filter), settings, scanCallback)
     }
 
@@ -650,9 +678,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
         isScanning = false
         try {
             bluetoothAdapter?.bluetoothLeScanner?.stopScan(scanCallback)
-        } catch (e: Exception) {
-            Log.w(TAG, "stopScan ignored: ${e.message}")
-        }
+        } catch (_: Exception) { }
     }
 
     private val scanCallback = object : ScanCallback() {
@@ -667,11 +693,9 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
     @SuppressLint("MissingPermission")
     private fun connectToDevice(device: BluetoothDevice) {
         disconnectGatt()
-        val name = device.name ?: "Garmin Venu"
-        _uiState.value = _uiState.value.copy(
-            connectionStatus = "CONNECTING",
-            deviceName = name
-        )
+        val name = device.name ?: "GARMIN VENU"
+        bleStatusText = "BLE: CONNECTING ($name)..."
+        broadcastHudUpdate()
         bluetoothGatt = device.connectGatt(this, false, gattCallback, BluetoothDevice.TRANSPORT_LE)
     }
 
@@ -681,8 +705,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
         try {
             bluetoothGatt?.disconnect()
             bluetoothGatt?.close()
-        } catch (_: Exception) {
-        }
+        } catch (_: Exception) { }
         bluetoothGatt = null
     }
 
@@ -690,15 +713,18 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
         @SuppressLint("MissingPermission")
         override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
             if (newState == BluetoothProfile.STATE_CONNECTED) {
-                _uiState.value = _uiState.value.copy(connectionStatus = "CONNECTED")
+                bleStatusText = "BLE: CONNECTED (${gatt.device?.name ?: "VENU"})"
+                broadcastHudUpdate()
                 gatt.discoverServices()
             } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                closeActiveExcursionIfNeeded()
-                _uiState.value = _uiState.value.copy(
-                    connectionStatus = "RECONNECTING",
-                    currentBpm = 0,
+                if (inExcursion) {
+                    closeAndPersistExcursion(settledHr = currentFilteredHr)
                     inExcursion = false
-                )
+                    excursionElapsedSec = 0
+                }
+                currentFilteredHr = 0
+                bleStatusText = "BLE: RECONNECTING..."
+                broadcastHudUpdate()
                 scheduleReconnect()
             }
         }
@@ -760,15 +786,38 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
         reconnectJob?.cancel()
         reconnectJob = serviceScope.launch {
             delay(4_000L)
-            if (_uiState.value.isArmed) {
+            if (isServiceRunning) {
                 startBleScan()
             }
         }
     }
 
     // -------------------------------------------------------------------------
-    // 6. DAY ROLLOVER (04:00 AM) & PERSISTENCE
+    // 6. HUD BROADCAST, DAY ROLLOVER & PERSISTENCE
     // -------------------------------------------------------------------------
+
+    private fun broadcastHudUpdate() {
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        val uiMode = if (powerManager.isInteractive) "COCKPIT_LIVE" else "COCKPIT_DARK"
+
+        val intent = Intent(ACTION_HUD_UPDATE).apply {
+            setPackage(packageName)
+            putExtra(EXTRA_HR, currentFilteredHr)
+            putExtra(EXTRA_EXCURSION_SEC, excursionElapsedSec)
+            putExtra(EXTRA_IN_EXCURSION, inExcursion)
+            putExtra(EXTRA_PEAK_HR, excursionPeakHr)
+            putExtra(EXTRA_DAILY_POINTS, dailyPoints)
+            putExtra(EXTRA_BUDGET_POINTS, budgetPoints)
+            putExtra(EXTRA_EXCURSION_POINTS, excursionPoints)
+            putExtra(EXTRA_STABILITY_SCORE, stabilityScore)
+            putExtra(EXTRA_ACTIVE_CEILING, activeCeilingBpm)
+            putExtra(EXTRA_GRACE_SEC, DEFAULT_GRACE_SEC)
+            putExtra(EXTRA_POSTURE_MULT, activePostureMult)
+            putExtra(EXTRA_MODE, uiMode)
+            putExtra(EXTRA_BLE_STATUS, bleStatusText)
+        }
+        sendBroadcast(intent)
+    }
 
     private fun currentPacingDayKey(): String {
         val now = Instant.now().atZone(ZoneId.systemDefault())
@@ -780,8 +829,8 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
         val key = currentPacingDayKey()
         if (key != activeDayKey) {
             activeDayKey = key
-            persistSpentPoints(0.0)
-            _uiState.value = _uiState.value.copy(spentPts = 0.0)
+            dailyPoints = 0.0
+            persistDailyPoints()
             serviceScope.launch {
                 refreshDailyGovernorFromHealthConnect()
             }
@@ -789,26 +838,26 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
     }
 
     private fun loadPersistedState() {
-        val prefs = getSharedPreferences("haven_pacing_prefs", Context.MODE_PRIVATE)
-        val savedDay = prefs.getString("active_day_key", activeDayKey)
-        val savedSpent = if (savedDay == activeDayKey) {
-            prefs.getFloat("spent_pts", 0f).toDouble()
+        val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        val savedDay = prefs.getString(KEY_ACTIVE_DAY, activeDayKey)
+        dailyPoints = if (savedDay == activeDayKey) {
+            prefs.getFloat(KEY_DAILY_POINTS, 0f).toDouble()
         } else {
             0.0
         }
-        _uiState.value = _uiState.value.copy(spentPts = savedSpent)
+        activePostureMult = prefs.getFloat(KEY_POSTURE_MULT, POSTURE_RECLINED.toFloat()).toDouble()
+        hasManualPostureOverride = prefs.getBoolean(KEY_MANUAL_POSTURE_OVERRIDE, false)
     }
 
-    private fun persistSpentPoints(spent: Double) {
-        val prefs = getSharedPreferences("haven_pacing_prefs", Context.MODE_PRIVATE)
-        prefs.edit()
-            .putString("active_day_key", activeDayKey)
-            .putFloat("spent_pts", spent.toFloat())
+    private fun persistDailyPoints() {
+        getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
+            .putString(KEY_ACTIVE_DAY, activeDayKey)
+            .putFloat(KEY_DAILY_POINTS, dailyPoints.toFloat())
             .apply()
     }
 
     // -------------------------------------------------------------------------
-    // 7. FOREGROUND NOTIFICATION
+    // 7. FOREGROUND NOTIFICATION & CLEANUP
     // -------------------------------------------------------------------------
 
     private fun createNotificationChannel() {
@@ -825,7 +874,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
     }
 
     private fun buildForegroundNotification(contentText: String): Notification {
-        val launchIntent = packageManager.getLaunchIntentForPackage(packageName)
+        val launchIntent = Intent(this, MainActivity::class.java)
         val pendingIntent = PendingIntent.getActivity(
             this,
             0,
@@ -849,10 +898,13 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
     }
 
     override fun onDestroy() {
+        isServiceRunning = false
+        if (inExcursion) {
+            closeAndPersistExcursion(settledHr = currentFilteredHr)
+        }
         try {
             unregisterReceiver(screenReceiver)
-        } catch (_: Exception) {
-        }
+        } catch (_: Exception) { }
         stopBleScan()
         disconnectGatt()
         unregisterSensors()
