@@ -56,6 +56,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.time.Instant
 import java.time.ZoneId
@@ -141,6 +142,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
     private var bluetoothGatt: BluetoothGatt? = null
     private var isScanning = false
     private var reconnectJob: Job? = null
+    private var rolloverWatchdogJob: Job? = null
     private var bleStatusText: String = "BLE: SCANNING FOR VENU..."
 
     // Telemetry & Excursion State
@@ -189,6 +191,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
         override fun onReceive(context: Context?, intent: Intent?) {
             if (intent?.action == Intent.ACTION_USER_PRESENT || intent?.action == Intent.ACTION_SCREEN_ON) {
                 lastScreenInteractiveMs = System.currentTimeMillis()
+                checkDayRollover()
             }
         }
     }
@@ -216,12 +219,14 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
 
         activeDayKey = currentPacingDayKey()
         loadPersistedState()
+        startRolloverWatchdog()
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         ensureForeground()
+        checkDayRollover()
 
         when (intent?.action) {
             ACTION_SET_POSTURE -> {
@@ -249,7 +254,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
                     refreshDailyGovernorFromHealthConnect()
                 }
                 startBleScan()
-                broadcastHudUpdate()
+                refreshNotificationAndHud()
             }
         }
 
@@ -440,22 +445,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
             }
         }
 
-        val postureTag = when {
-            activePostureMult <= 0.25 -> "REC"
-            activePostureMult <= 0.75 -> "SEAT"
-            else -> "UP"
-        }
-        updateNotification(
-            String.format(
-                Locale.US,
-                "HR %d BPM • %s • %.1f/%.0f PTS",
-                filteredBpm,
-                postureTag,
-                dailyPoints,
-                budgetPoints
-            )
-        )
-        broadcastHudUpdate()
+        refreshNotificationAndHud()
     }
 
     private fun closeAndPersistExcursion(settledHr: Int) {
@@ -490,7 +480,6 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
             engine.language = Locale.UK
             engine.setSpeechRate(0.95f)
 
-            // Explicitly prefer offline British female voice (e.g., en-gb-x-gba-local / rjs / fis)
             try {
                 val ukVoices = engine.voices?.filter { voice ->
                     voice.locale.language.equals("en", ignoreCase = true) &&
@@ -645,7 +634,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
         }
 
         activeCeilingBpm = DEFAULT_CEILING_BPM
-        broadcastHudUpdate()
+        refreshNotificationAndHud()
     }
 
     // -------------------------------------------------------------------------
@@ -808,8 +797,38 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
     }
 
     // -------------------------------------------------------------------------
-    // 6. HUD BROADCAST, DAY ROLLOVER & PERSISTENCE
+    // 6. HUD BROADCAST, 04:00 AM DAY ROLLOVER WATCHDOG & PERSISTENCE
     // -------------------------------------------------------------------------
+
+    private fun startRolloverWatchdog() {
+        rolloverWatchdogJob?.cancel()
+        rolloverWatchdogJob = serviceScope.launch {
+            while (isActive) {
+                delay(60_000L)
+                mainHandler.post { checkDayRollover() }
+            }
+        }
+    }
+
+    private fun refreshNotificationAndHud() {
+        val postureTag = when {
+            activePostureMult <= 0.25 -> "REC"
+            activePostureMult <= 0.75 -> "SEAT"
+            else -> "UP"
+        }
+        val hrDisplay = if (currentFilteredHr > 0) "$currentFilteredHr BPM" else "-- BPM"
+        updateNotification(
+            String.format(
+                Locale.US,
+                "HR %s • %s • %.1f/%.0f PTS",
+                hrDisplay,
+                postureTag,
+                dailyPoints,
+                budgetPoints
+            )
+        )
+        broadcastHudUpdate()
+    }
 
     private fun broadcastHudUpdate() {
         val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
@@ -843,9 +862,12 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
     private fun checkDayRollover() {
         val key = currentPacingDayKey()
         if (key != activeDayKey) {
+            Log.i(TAG, "04:00 AM Pacing Day Rollover: $activeDayKey -> $key (resetting points to 0.0)")
             activeDayKey = key
             dailyPoints = 0.0
+            excursionPoints = 0.0
             persistDailyPoints()
+            refreshNotificationAndHud()
             serviceScope.launch {
                 refreshDailyGovernorFromHealthConnect()
             }
@@ -854,11 +876,12 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
 
     private fun loadPersistedState() {
         val prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
-        val savedDay = prefs.getString(KEY_ACTIVE_DAY, activeDayKey)
-        dailyPoints = if (savedDay == activeDayKey) {
-            prefs.getFloat(KEY_DAILY_POINTS, 0f).toDouble()
+        val savedDay = prefs.getString(KEY_ACTIVE_DAY, null)
+        if (savedDay == activeDayKey) {
+            dailyPoints = prefs.getFloat(KEY_DAILY_POINTS, 0f).toDouble()
         } else {
-            0.0
+            dailyPoints = 0.0
+            persistDailyPoints()
         }
         activePostureMult = prefs.getFloat(KEY_POSTURE_MULT, POSTURE_RECLINED.toFloat()).toDouble()
         hasManualPostureOverride = prefs.getBoolean(KEY_MANUAL_POSTURE_OVERRIDE, false)
@@ -914,6 +937,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
 
     override fun onDestroy() {
         isServiceRunning = false
+        rolloverWatchdogJob?.cancel()
         if (inExcursion) {
             closeAndPersistExcursion(settledHr = currentFilteredHr)
         }
