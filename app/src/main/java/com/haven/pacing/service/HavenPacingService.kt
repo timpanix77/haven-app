@@ -302,7 +302,6 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
             }
             Sensor.TYPE_STEP_DETECTOR -> {
                 lastStepTimestampMs = System.currentTimeMillis()
-                // Walking clears any stale manual posture lock so autonomous tracking resumes
                 if (hasManualPostureOverride) {
                     hasManualPostureOverride = false
                     getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE).edit()
@@ -330,21 +329,16 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
             powerManager.isInteractive ||
             (now - lastScreenInteractiveMs) < 15 * 60_000L
 
-        // Scenario A: Phone left stationary (nightstand / sofa / kitchen table)
         if (isStationary) {
-            // Unattended-phone HR excursion override (bathroom trip, feeding Sue, letting Red out)
             if (hr >= activeCeilingBpm) {
                 return POSTURE_UPRIGHT
             }
-            // Kitchen table with YouTube/media playing or recently unlocked screen
             if (mediaOrScreenActive) {
                 return if (hr >= 96) POSTURE_UPRIGHT else POSTURE_SEATED
             }
-            // Stationary, dark screen, settled HR -> resting reclined
             return POSTURE_RECLINED
         }
 
-        // Scenario B: Phone on-body / in-hand / moving
         val mag = sqrt(gravX * gravX + gravY * gravY + gravZ * gravZ).coerceAtLeast(0.1f)
         val normY = abs(gravY) / mag
         val normZ = abs(gravZ) / mag
@@ -487,13 +481,35 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
     }
 
     // -------------------------------------------------------------------------
-    // 3. BLUETOOTH-AWARE TELEMETRY VOICE ("Heartrate. [BPM].") & ALERT MODES
+    // 3. BRITISH FEMALE TELEMETRY VOICE ("Heartrate. [BPM].") & BT AUTO-HANDOFF
     // -------------------------------------------------------------------------
 
     override fun onInit(status: Int) {
         if (status == TextToSpeech.SUCCESS) {
-            tts?.language = Locale.US
-            tts?.setSpeechRate(0.95f)
+            val engine = tts ?: return
+            engine.language = Locale.UK
+            engine.setSpeechRate(0.95f)
+
+            // Explicitly prefer offline British female voice (e.g., en-gb-x-gba-local / rjs / fis)
+            try {
+                val ukVoices = engine.voices?.filter { voice ->
+                    voice.locale.language.equals("en", ignoreCase = true) &&
+                        voice.locale.country.equals("GB", ignoreCase = true) &&
+                        !voice.isNetworkConnectionRequired
+                }.orEmpty()
+
+                val preferredFemale = ukVoices.firstOrNull { v ->
+                    val n = v.name.lowercase(Locale.US)
+                    n.contains("gba") || n.contains("fis") || n.contains("female") || n.contains("sfg")
+                } ?: ukVoices.firstOrNull()
+
+                if (preferredFemale != null) {
+                    engine.voice = preferredFemale
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Using default UK voice: ${e.message}")
+            }
+
             ttsReady = true
         }
     }
@@ -565,7 +581,6 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
             val hcClient = HealthConnectClient.getOrCreate(this)
             val now = Instant.now()
 
-            // Primary window: 16h; Fallback window: 72h for fragmented ME/CFS sleep
             val hrvResponse = hcClient.readRecords(
                 ReadRecordsRequest(
                     recordType = HeartRateVariabilityRmssdRecord::class,
