@@ -131,7 +131,8 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
         const val VOICE_REPEAT_COOLDOWN_MS = 90_000L
 
         const val BUDGET_FLOOR_PTS = 12.0
-        const val BUDGET_DEFAULT_PTS = 16.0
+        const val BUDGET_GUARDED_PTS = 16.0
+        const val BUDGET_DEFAULT_PTS = 20.0
         const val BUDGET_MAX_PTS = 20.0
 
         @Volatile
@@ -170,7 +171,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
     private var dailyPoints: Double = 0.0
     private var budgetPoints: Double = BUDGET_DEFAULT_PTS
     private var activeCeilingBpm: Int = DEFAULT_CEILING_BPM
-    private var stabilityScore: Int = 75
+    private var stabilityScore: Int = 85
     private var activePostureMult: Double = POSTURE_RECLINED
     private var hasManualPostureOverride: Boolean = false
 
@@ -575,7 +576,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
     }
 
     // -------------------------------------------------------------------------
-    // 4. HEALTH CONNECT HRV GOVERNOR WITH 72-HOUR & RHR FALLBACK
+    // 4. HEALTH CONNECT HRV GOVERNOR (20 PTS DEFAULT; TRIM ONLY IF RED FLAG)
     // -------------------------------------------------------------------------
 
     private suspend fun refreshDailyGovernorFromHealthConnect() {
@@ -616,40 +617,34 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
         hrvRecord: HeartRateVariabilityRmssdRecord?,
         restingBpm: Long?
     ) {
-        val now = Instant.now()
-        val isFreshOvernight = hrvRecord != null &&
-            ChronoUnit.HOURS.between(hrvRecord.time, now) <= 16
-
+        // Default to full 20.0 PTS unless biometrics indicate a guarded or crash/danger state
         if (hrvRecord != null) {
             val rmssd = hrvRecord.heartRateVariabilityMillis
-            val rawCap = when {
-                rmssd >= 45.0 -> 20.0
-                rmssd >= 35.0 -> 18.0
-                rmssd >= 26.0 -> 15.0
-                else -> 12.0
+            budgetPoints = when {
+                rmssd >= 32.0 -> BUDGET_DEFAULT_PTS // 20.0 PTS
+                rmssd >= 24.0 -> BUDGET_GUARDED_PTS // 16.0 PTS
+                else -> BUDGET_FLOOR_PTS            // 12.0 PTS (crash/danger)
             }
-            val adjusted = if (isFreshOvernight) rawCap else (rawCap - 1.5)
-            budgetPoints = adjusted.coerceIn(BUDGET_FLOOR_PTS, BUDGET_MAX_PTS)
             stabilityScore = when {
-                rmssd >= 45.0 -> 88
-                rmssd >= 35.0 -> 78
-                rmssd >= 26.0 -> 64
-                else -> 48
+                rmssd >= 32.0 -> 86
+                rmssd >= 24.0 -> 64
+                else -> 44
             }
         } else if (restingBpm != null) {
             budgetPoints = when {
-                restingBpm <= 66 -> 18.0
-                restingBpm <= 72 -> 15.0
-                else -> 12.0
+                restingBpm <= 70 -> BUDGET_DEFAULT_PTS // 20.0 PTS
+                restingBpm <= 75 -> BUDGET_GUARDED_PTS // 16.0 PTS
+                else -> BUDGET_FLOOR_PTS               // 12.0 PTS (elevated RHR danger)
             }
             stabilityScore = when {
-                restingBpm <= 66 -> 78
-                restingBpm <= 72 -> 64
-                else -> 48
+                restingBpm <= 70 -> 85
+                restingBpm <= 75 -> 64
+                else -> 44
             }
         } else {
+            // No red flags detected -> grant full 20.0 PTS
             budgetPoints = BUDGET_DEFAULT_PTS
-            stabilityScore = 70
+            stabilityScore = 85
         }
 
         activeCeilingBpm = DEFAULT_CEILING_BPM
