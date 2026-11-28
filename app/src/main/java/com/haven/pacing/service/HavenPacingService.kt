@@ -112,6 +112,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
         const val EXTRA_POSTURE_MULT = "extra_posture_mult"
         const val EXTRA_MODE = "extra_mode"
         const val EXTRA_BLE_STATUS = "extra_ble_status"
+        const val EXTRA_DAY_KEY = "extra_day_key"
 
         // Standard Bluetooth Heart Rate Service & Characteristics
         val HR_SERVICE_UUID: UUID = UUID.fromString("0000180d-0000-1000-8000-00805f9b34fb")
@@ -358,7 +359,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
     }
 
     // -------------------------------------------------------------------------
-    // 2. HR INGESTION, 3-SAMPLE MEDIAN FILTER, STRAIN & RECOVERY CLEAR
+    // 2. HR INGESTION, 3-SAMPLE MEDIAN FILTER, CALIBRATED STRAIN & RECOVERY CLEAR
     // -------------------------------------------------------------------------
 
     private fun onRawHeartRateReceived(rawBpm: Int) {
@@ -407,16 +408,21 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
             excursionElapsedSec = ((now - excursionStartMs) / 1000L).toInt()
             excursionPeakHr = max(excursionPeakHr, filteredBpm)
 
-            val bpmAboveFloor = (filteredBpm - 65).coerceAtLeast(1)
-            val rawPtsPerMin = (bpmAboveFloor / 25.0) * 1.25
-            val stepPts = rawPtsPerMin * (dtSec / 60.0) * activePostureMult
-
-            excursionPoints += stepPts
-            dailyPoints += stepPts
-            persistDailyPoints()
-
             val graceExpired = excursionElapsedSec >= DEFAULT_GRACE_SEC
             val emergencySpike = filteredBpm >= ANAEROBIC_EMERGENCY_BPM
+
+            // Grace Buffer protection: 0.0 PTS during initial 120s unless anaerobic (>=115 BPM)
+            if (graceExpired || emergencySpike) {
+                val bpmAboveCeiling = (filteredBpm - (activeCeilingBpm - 1)).coerceAtLeast(1)
+                val basePtsPerMin = (bpmAboveCeiling / 20.0) * 0.50
+                val anaerobicMult = if (emergencySpike) 1.50 else 1.00
+                val stepPts = basePtsPerMin * anaerobicMult * (dtSec / 60.0) * activePostureMult
+
+                excursionPoints += stepPts
+                dailyPoints += stepPts
+                persistDailyPoints()
+            }
+
             if ((graceExpired || emergencySpike) && (now - lastVoiceAlertMs >= VOICE_REPEAT_COOLDOWN_MS)) {
                 lastVoiceAlertMs = now
                 awaitingRecoveryClear = true
@@ -849,6 +855,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
             putExtra(EXTRA_POSTURE_MULT, activePostureMult)
             putExtra(EXTRA_MODE, uiMode)
             putExtra(EXTRA_BLE_STATUS, bleStatusText)
+            putExtra(EXTRA_DAY_KEY, activeDayKey)
         }
         sendBroadcast(intent)
     }
@@ -866,6 +873,7 @@ class HavenPacingService : Service(), TextToSpeech.OnInitListener, SensorEventLi
             activeDayKey = key
             dailyPoints = 0.0
             excursionPoints = 0.0
+            excursionPeakHr = 0
             persistDailyPoints()
             refreshNotificationAndHud()
             serviceScope.launch {
