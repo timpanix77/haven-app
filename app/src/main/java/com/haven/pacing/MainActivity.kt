@@ -70,6 +70,7 @@ class MainActivity : AppCompatActivity() {
     private var latchedPeakHr: Int = 0
     private var currentSurgePeakHr: Int = 0
     private var activePostureMult: Double = HavenPacingService.POSTURE_RECLINED
+    private var renderedDayKey: String = ""
 
     private val healthPermissions = setOf(
         HealthPermission.getReadPermission(HeartRateVariabilityRmssdRecord::class),
@@ -133,14 +134,15 @@ class MainActivity : AppCompatActivity() {
                     intent.getBooleanExtra(HavenPacingService.EXTRA_IN_EXCURSION, false),
                     intent.getIntExtra(HavenPacingService.EXTRA_PEAK_HR, 0),
                     intent.getDoubleExtra(HavenPacingService.EXTRA_DAILY_POINTS, 0.0),
-                    intent.getDoubleExtra(HavenPacingService.EXTRA_BUDGET_POINTS, 20.0),
+                    intent.getDoubleExtra(HavenPacingService.EXTRA_BUDGET_POINTS, 16.0),
                     intent.getDoubleExtra(HavenPacingService.EXTRA_EXCURSION_POINTS, 0.0),
                     intent.getIntExtra(HavenPacingService.EXTRA_STABILITY_SCORE, 75),
-                    intent.getIntExtra(HavenPacingService.EXTRA_ACTIVE_CEILING, 88),
+                    intent.getIntExtra(HavenPacingService.EXTRA_ACTIVE_CEILING, 89),
                     intent.getIntExtra(HavenPacingService.EXTRA_GRACE_SEC, 120),
                     intent.getDoubleExtra(HavenPacingService.EXTRA_POSTURE_MULT, activePostureMult),
                     intent.getStringExtra(HavenPacingService.EXTRA_MODE) ?: "COCKPIT_LIVE",
-                    intent.getStringExtra(HavenPacingService.EXTRA_BLE_STATUS) ?: ""
+                    intent.getStringExtra(HavenPacingService.EXTRA_BLE_STATUS) ?: "",
+                    intent.getStringExtra(HavenPacingService.EXTRA_DAY_KEY) ?: ""
                 )
             }
         }
@@ -244,7 +246,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         renderTelemetry(
-            0, 0, false, 0, 0.0, 20.0, 0.0, 75, 88, 120,
+            0, 0, false, 0, 0.0, 16.0, 0.0, 75, 89, 120,
             activePostureMult, "COCKPIT_LIVE", "BLE: READY - TAP 'ARM' TO START"
         )
         checkPermissionsAndStartService()
@@ -314,7 +316,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         btnAlertMode.setOnLongClickListener {
-            Toast.makeText(this, "Testing Alarm-Stream Voice Alert...", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "Testing Voice Telemetry...", Toast.LENGTH_SHORT).show()
             try {
                 startService(Intent(this, HavenPacingService::class.java).apply {
                     action = HavenPacingService.ACTION_TEST_ALERT
@@ -609,8 +611,18 @@ class MainActivity : AppCompatActivity() {
         graceSec: Int,
         postureMult: Double,
         mode: String,
-        bleStatus: String = ""
+        bleStatus: String = "",
+        dayKey: String = ""
     ) {
+        if (dayKey.isNotEmpty() && dayKey != renderedDayKey) {
+            if (renderedDayKey.isNotEmpty()) {
+                latchedPeakHr = 0
+                currentSurgePeakHr = 0
+                lastRecordedExcursionSec = 0
+            }
+            renderedDayKey = dayKey
+        }
+
         activePostureMult = postureMult
 
         if (hr > 0) {
